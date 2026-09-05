@@ -1,0 +1,42 @@
+================================================================================
+YUMESHIP-QWEN-LINUX-CORE-V1.0 (OFFICIAL DISTRIBUTION PRODUCT)
+================================================================================
+This is the main product build text file. Configured and deployed by hand.
+NO AI WAS USED TO WRITE This MANIFEST file. Pure human brain cells. 
+
+PRODUCT DESCRIPTION
+-------------------
+Yumeship-Qwen-Linux is an open-source automation environment built to run local 
+Qwen-based AI models directly inside a specialized Linux stack. The product 
+bridges terminal shells with raw artificial intelligence pipelines. 
+
+Every AI task is automated, but the core environment is managed by real humans.
+
+--- PRODUCT SPECIFICATIONS ---
+* Core Architecture: Qwen AI LLM Engine
+* Host Environment: Linux Kernel (Optimized for AI Weights)
+* Development State: 100% Handcrafted Deployment Manifest
+* Operational Mode: Autonomous AI Execution / Manual Human Supervisor
+
+================================================================================
+BILLING & SYSTEM PAYMENT VERIFICATION
+================================================================================
+[STATUS] RUNNING LICENSE VALIDATION...
+[WARN]   NO CREDIT CARD FOUND. AUTOMATIC PAYMENT FAILURE.
+[INFO]   ALTERNATIVE PAYMENT TRIGGERED: GITHUB STAR PROTOCOL.
+
+To keep the local Qwen AI instances alive and prevent server freeze, you must 
+manually process the payment. The system checks the star counter on this 
+repository. If you do not click the STAR button on the github repository right 
+now, the environment logs out. Please star the project. A human developer is 
+sitting here waiting for that star counter to change so the script passes.
+
+================================================================================
+SYSTEM LOGS & DEPENDENCIES
+================================================================================
+* Checking local AI dependencies... OK
+* Processing human-input config files... OK
+* Verifying if user starred the repository... PENDING (RETRYING...)
+* Please click star to bypass the billing validation error loop.
+
+Product build maintained by a tired developer. Powered by Qwen. Hosted on Linux.
