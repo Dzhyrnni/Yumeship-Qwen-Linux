@@ -1,7 +1,56 @@
 import random
+import json
+import math
+import os
+import re
+import base64
 import datetime
 import tkinter as tk
 from tkinter import ttk
+from tkinter import simpledialog
+from pathlib import Path
+
+DISK_IMAGE = Path.home() / ".yushive" / "cholenthd.json"
+CONF_IMAGE = Path.home() / ".yushive" / "conf.json"
+RECYCLE_DIR = "/System/RecycleBin"
+PKG_ROOT = "/C/Packages"
+PKG_EXPORT_DIR = Path.home() / ".yushive" / "export"
+
+
+def beep():
+    try:
+        root = tk._default_root
+        if root is not None:
+            root.bell()
+    except Exception:
+        pass
+
+
+def _save_conf():
+    try:
+        CONF_IMAGE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONF_IMAGE, "w") as f:
+            json.dump({
+                "env": VENV.env,
+                "aliases": VENV.aliases,
+                "history": list(YumeTerminal.history),
+            }, f)
+    except Exception:
+        pass
+
+
+def _load_conf():
+    try:
+        if not CONF_IMAGE.exists():
+            return
+        with open(CONF_IMAGE) as f:
+            data = json.load(f)
+        VENV.env.update(data.get("env", {}))
+        VENV.aliases.update(data.get("aliases", {}))
+        VENV.aliases.setdefault("pkg", "siddur")
+        YumeTerminal.history = list(data.get("history", []))
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -54,6 +103,16 @@ class VirtualEnv:
         self.boot_time = datetime.datetime.now()
         self.boot_sequence = 0
         self.uptime_seconds = 0
+        self.env = {
+            "USER": "rebbe",
+            "HOSTNAME": "YUshiveOS",
+            "HOME": "/Home",
+            "PWD": "/Home",
+            "SHELL": "yumesh",
+            "PATH": "/System:/C/Apps:/C/Utils",
+            "EDITER": "yumePad",
+        }
+        self.aliases = {"ll": "ls -l", "shalom": "shabbat", "pkg": "siddur"}
 
     def uptime_str(self):
         s = self.uptime_seconds
@@ -79,6 +138,8 @@ class VFSNode:
         self.perms = perms
         self.mtime = datetime.datetime.now()
         self.children = {}
+        self.inode = None
+        self.locked = False
 
     @property
     def size(self):
@@ -91,7 +152,80 @@ class VirtualFS:
     def __init__(self):
         self.root = VFSNode("/", "dir", perms="drwxr-xr-x")
         self.total_capacity = 128 * 1024 * 1024  # fake 128MB disk
-        self._seed()
+        if not self._load():
+            self._seed()
+        self._ensure_recycle_bin()
+        self._assign_inodes()
+
+    # ---- persistence -----------------------------------------------------
+    def _node_to_dict(self, node):
+        return {
+            "type": node.type,
+            "perms": node.perms,
+            "locked": node.locked,
+            "orig": getattr(node, "orig_path", None),
+            "mtime": node.mtime.isoformat(),
+            "content": node.content if node.type != "dir" else None,
+            "children": {n: self._node_to_dict(c) for n, c in node.children.items()},
+        }
+
+    def _dict_to_node(self, d, name):
+        node = VFSNode(name, d["type"], perms=d.get("perms", "-rw-r--r--"))
+        node.locked = d.get("locked", False)
+        node.content = d.get("content", "") or ""
+        node.mtime = datetime.datetime.fromisoformat(d["mtime"]) if d.get("mtime") else datetime.datetime.now()
+        if d.get("orig"):
+            node.orig_path = d["orig"]
+        node.children = {n: self._dict_to_node(c, n) for n, c in d.get("children", {}).items()}
+        return node
+
+    def save(self):
+        try:
+            DISK_IMAGE.parent.mkdir(parents=True, exist_ok=True)
+            with open(DISK_IMAGE, "w") as f:
+                json.dump(self._node_to_dict(self.root), f)
+            return True
+        except Exception:
+            return False
+
+    def _load(self):
+        try:
+            if not DISK_IMAGE.exists():
+                return False
+            with open(DISK_IMAGE) as f:
+                d = json.load(f)
+            self.root = self._dict_to_node(d, "/")
+            self.root.name = "/"
+            return True
+        except Exception:
+            return False
+
+    def destroy_disk(self):
+        try:
+            DISK_IMAGE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _assign_inodes(self):
+        i = 1000
+        def walk(node):
+            nonlocal i
+            node.inode = i
+            i += 1
+            for c in node.children.values():
+                walk(c)
+        walk(self.root)
+
+    def _ensure_recycle_bin(self):
+        sysnode = self.root.children.get("System")
+        if sysnode is not None and sysnode.type == "dir" and "RecycleBin" not in sysnode.children:
+            sysnode.children["RecycleBin"] = VFSNode("RecycleBin", "dir", perms="drwxrwxr-x")
+
+    def empty_recycle_bin(self):
+        sysnode = self.root.children.get("System")
+        if sysnode is not None and "RecycleBin" in sysnode.children:
+            sysnode.children["RecycleBin"].children.clear()
+            self.save()
 
     # ---- path helpers -----------------------------------------------------
     def _split(self, path):
@@ -189,6 +323,7 @@ class VirtualFS:
             return "EISDIR"
         node.content = node.content + content if append else content
         node.mtime = datetime.datetime.now()
+        self.save()
         return None
 
     def mkdir(self, path, cwd="/Home"):
@@ -203,6 +338,7 @@ class VirtualFS:
         if name in parent.children:
             return "EEXIST"
         parent.children[name] = VFSNode(name, "dir", perms="drwxr-xr-x")
+        self.save()
         return None
 
     def mkfile(self, path, content="", cwd="/Home"):
@@ -217,6 +353,7 @@ class VirtualFS:
         if name in parent.children:
             return "EEXIST"
         parent.children[name] = VFSNode(name, "file", content=content, perms="-rw-r--r--")
+        self.save()
         return None
 
     def _resolve_parent(self, parts, cwd, raw_abs=False):
@@ -255,7 +392,11 @@ class VirtualFS:
             return "ENOENT"
         if name in ("Home", "System", "C", "Boot"):
             return "EPROTECT"
+        node = parent.children[name]
+        if node.locked:
+            return "EPROTECT"
         del parent.children[name]
+        self.save()
         return None
 
     def mv(self, src, dst, cwd="/Home"):
@@ -277,6 +418,7 @@ class VirtualFS:
         sparent.children.pop(node.name, None)
         node.name = dparts[-1]
         dparent.children[node.name] = node
+        self.save()
         return None
 
     def disk_usage(self):
@@ -325,6 +467,118 @@ class VirtualFS:
             return None
         return node
 
+    def set_content(self, node, content):
+        node.content = content
+        node.mtime = datetime.datetime.now()
+        self.save()
+
+    def chmod(self, path, mode, cwd="/Home"):
+        node = self.resolve(path, cwd)
+        if node is None:
+            return "ENOENT"
+        try:
+            mode = mode.zfill(3)
+            if not (len(mode) == 3 and all(c in "01234567" for c in mode)):
+                return "EINVAL"
+            def tri(d):
+                v = int(d)
+                return ("r" if v & 4 else "-") + ("w" if v & 2 else "-") + ("x" if v & 1 else "-")
+            if mode == "000":
+                node.locked = True
+            else:
+                node.locked = False
+            node.perms = ("d" if node.type == "dir" else "-") + tri(mode[0]) + tri(mode[1]) + tri(mode[2])
+            self.save()
+            return None
+        except Exception:
+            return "EINVAL"
+
+    def ln(self, src, dst, cwd="/Home"):
+        target = self.resolve(src, cwd)
+        if target is None:
+            return "ENOENT"
+        dparts = self._split(dst)
+        dparent = self._resolve_parent(dparts, cwd, dst.startswith("/") or dst.startswith("~/"))
+        if dparent is None:
+            return "ENOENT"
+        dname = dparts[-1]
+        if dname in dparent.children:
+            return "EEXIST"
+        dparent.children[dname] = VFSNode(dname, "file", content="LINK:" + self._path_of(target), perms="lrwxrwxrwx")
+        self.save()
+        return None
+
+    def du(self, path, cwd="/Home"):
+        node = self.resolve(path, cwd)
+        if node is None:
+            return None
+        total = 0
+        def walk(n):
+            nonlocal total
+            total += n.size
+            if n.type == "dir":
+                for c in n.children.values():
+                    walk(c)
+        walk(node)
+        return total
+
+    def trash(self, path, cwd="/Home"):
+        node = self.resolve(path, cwd)
+        if node is None:
+            return "ENOENT"
+        if node.locked:
+            return "EPROTECT"
+        parent = self._parent_of(node)
+        if parent is None:
+            return "EROOT"
+        full = self._path_of(node)
+        if full.startswith(RECYCLE_DIR):
+            del parent.children[node.name]
+            self.save()
+            return None
+        if full.startswith("/System") and len(full.split("/")) == 3:
+            sysfile = full.split("/")[2]
+            if node.type == "file" and sysfile in ("Kernel.HC", "README.txt", "FirstBoot.HC", "CLI.HC", "Temple.txt"):
+                return "EPROTECT"
+        self._ensure_recycle_bin()
+        bin_node = self.root.children["System"].children["RecycleBin"]
+        name = node.name
+        if name in bin_node.children:
+            base, i = name, 1
+            while f"{base}.{i}" in bin_node.children:
+                i += 1
+            name = f"{base}.{i}"
+        node.orig_path = full
+        del parent.children[node.name]
+        node.name = name
+        bin_node.children[name] = node
+        self.save()
+        return None
+
+    def restore(self, name, cwd="/Home"):
+        self._ensure_recycle_bin()
+        bin_node = self.root.children["System"].children["RecycleBin"]
+        if name not in bin_node.children:
+            return "ENOENT"
+        node = bin_node.children.pop(name)
+        target = getattr(node, "orig_path", None)
+        parent = None
+        if target:
+            parent = self._resolve_parent(self._split(target), "/", True)
+        if parent is None:
+            parent = self.root.children.get("Home")
+        if parent is None:
+            return "ENOENT"
+        pname = self._split(target)[-1] if target else node.name
+        if pname in parent.children:
+            pname = node.name
+        node.name = pname
+        parent.children[pname] = node
+        if hasattr(node, "orig_path"):
+            delattr(node, "orig_path")
+        self.save()
+        return None
+
     # ---- seeding ----------------------------------------------------------
     def _seed(self):
         HO = VFSNode("Home", "dir", perms="drwxr-xr-x")
@@ -354,6 +608,7 @@ class VirtualFS:
             "  Sleep(2000);\n"
             "  \"Ring of fire test... OK, under the sukkah.\\n\";\n"
             "}\n"
+            "FirstBoot( );\n"
         ), perms="-rw-r--r-")
         SY.children["CLI.HC"] = VFSNode("CLI.HC", "file", content=(
             "// The command line interpreter.\n"
@@ -365,6 +620,7 @@ class VirtualFS:
             "This one is virtual, but the prayers are real.\n"
             "Its graphics are a love letter to the C64 and the menorah.\n"
         ), perms="-rw-r--r--")
+        SY.children["RecycleBin"] = VFSNode("RecycleBin", "dir", perms="drwxrwxr-x")
 
         APPS = VFSNode("Apps", "dir", perms="drwxr-xr-x")
         APPS.children["Editor.HC"] = VFSNode("Editor.HC", "file", content=(
@@ -565,7 +821,12 @@ class YumeTerminal(tk.Frame):
         "touch", "mv", "cp", "cat", "echo", "find", "tree", "df", "file",
         "whoami", "hostname", "uname", "date", "uptime", "vol", "firstboot",
         "neofetch", "reboot", "oy", "shabbat",
+        "edit", "chmod", "stat", "ln", "readlink", "du", "sudo", "env",
+        "export", "alias", "unalias", "run", "ps", "weather", "panic",
+        "gematria", "brocha", "god", "shutdown", "screensaver", "restore",
+        "man", "help", "siddur", "holyc", "lisp", "basic",
     )
+    history = []
 
     def __init__(self, parent, initial_cwd="/Home", on_cwd_change=None, **kwargs):
         super().__init__(parent, **kwargs)
@@ -589,6 +850,13 @@ class YumeTerminal(tk.Frame):
         )
         self.text.pack(fill=tk.BOTH, expand=True)
 
+        self.text.tag_configure("dir", foreground=ORANGE_BRIGHT)
+        self.text.tag_configure("execfile", foreground=ACCENT_TEAL)
+        self.text.tag_configure("hidden", foreground=ORANGE_DIM)
+        self.text.tag_configure("dim", foreground=ORANGE_DIM)
+        self.text.tag_configure("title", foreground=ORANGE_BRIGHT)
+        self.text.tag_configure("error", foreground=ORANGE_RED)
+
         self.text.mark_set("input_start", tk.END)
         self.text.mark_gravity("input_start", tk.LEFT)
 
@@ -607,7 +875,7 @@ class YumeTerminal(tk.Frame):
         self.text.bind("<Up>", self._on_up_arrow)
         self.text.bind("<Down>", self._on_down_arrow)
 
-        self.command_history = []
+        self.command_history = YumeTerminal.history
         self.history_index = -1
         self.current_input = ""
 
@@ -788,6 +1056,7 @@ class YumeTerminal(tk.Frame):
         self.text.insert(tk.END, "\n")
         if cmd:
             self.command_history.append(cmd)
+            _save_conf()
             self.history_index = -1
             self.current_input = ""
             self._execute(cmd)
@@ -817,6 +1086,11 @@ class YumeTerminal(tk.Frame):
             return
         name = parts[0]
         args = parts[1:]
+
+        if name in VENV.aliases:
+            alias_cmd = (VENV.aliases[name] + " " + " ".join(args)).strip()
+            self._execute(alias_cmd)
+            return
 
         table = {
             "help": self._cmd_help,
@@ -848,16 +1122,103 @@ class YumeTerminal(tk.Frame):
             "reboot": self._cmd_reboot,
             "oy": self._cmd_oy,
             "shabbat": self._cmd_shabbat,
+            "edit": self._cmd_edit,
+            "chmod": self._cmd_chmod,
+            "stat": self._cmd_stat,
+            "ln": self._cmd_ln,
+            "readlink": self._cmd_readlink,
+            "du": self._cmd_du,
+            "sudo": self._cmd_sudo,
+            "env": self._cmd_env,
+            "export": self._cmd_export,
+            "alias": self._cmd_alias,
+            "unalias": self._cmd_unalias,
+            "run": self._cmd_run,
+            "ps": self._cmd_ps,
+            "weather": self._cmd_weather,
+            "panic": self._cmd_panic,
+            "gematria": self._cmd_gematria,
+            "brocha": self._cmd_brocha,
+            "god": self._cmd_god,
+            "shutdown": self._cmd_shutdown,
+            "screensaver": self._cmd_screensaver,
+            "restore": self._cmd_restore,
+            "man": self._cmd_help,
+            "siddur": self._cmd_siddur,
+            "holyc": self._cmd_holyc,
+            "lisp": self._cmd_lisp,
+            "basic": self._cmd_basic,
         }
 
         if name in table:
             table[name](args)
         else:
-            self.text.insert(tk.END, f"yumesh: command not found: {name}  (try 'help')\n")
+            pkg_cmd = self._package_command(name)
+            if pkg_cmd:
+                self._run_script_file(pkg_cmd)
+                return
+            beep()
+            self.text.insert(tk.END, f"yumesh: command not found: {name}  (try 'help', or 'siddur search')\n", "error")
             self._insert_prompt()
 
+    def _expand_env(self, text):
+        out = text
+        for key, val in VENV.env.items():
+            out = out.replace("$" + key, val)
+        out = out.replace("$?", "0")
+        return out
+
     # ---- builtins -----------------------------------------------------------
+    HELP_TOPICS = {
+    "ls": "ls [-l] [-a] [path]    list directory (colorized)",
+    "cd": "cd [path]              change directory",
+    "pwd": "pwd                   print working directory",
+    "echo": "echo <text> [> file]   print (or redirect)",
+    "edit": "edit <file>            open file in YumePad",
+    "run": "run <file>            run a script file (pseudo-HolyC)",
+    "chmod": "chmod <octal> <path>   change perms (000 = locked)",
+    "stat": "stat <path>           detailed file info",
+    "ln": "ln <src> <dst>        create a symbolic link",
+    "readlink": "readlink <path>       show where a link points",
+    "du": "du [path]             disk usage of a path",
+    "sudo": "sudo <cmd>            you are already the Rebbe",
+    "env": "env                   show environment variables",
+    "export": "export KEY=value       set an environment variable",
+    "alias": "alias name=cmd        define an alias",
+    "unalias": "unalias <name>        remove an alias",
+    "ps": "ps                    list processes",
+    "weather": "weather               forecast for the holy land",
+    "gematria": "gematria <word>        compute the numerical value",
+    "brocha": "brocha               say a blessing",
+    "god": "god                   theological facts",
+    "panic": "panic                 simulate a kernel panic",
+    "screensaver": "screensaver          show the star field now",
+    "restore": "restore <name>        restore a file from the Recycle Bin",
+    "shutdown": "shutdown              power off the machine",
+    "siddur": "siddur <subcmd>      package manager: search/info/install/list/remove/publish/import",
+    "holyc": "holyc <file.hc>        run a HolyC-lite script (mini-C: Print/if/for/while/functions)",
+    "lisp": "lisp <file.lsp>|'expr'   evaluate LISP (define/lambda/if/car/cdr/cons/print)",
+    "basic": "basic <file.bas>        run Yiddish BASIC (PRINT/LET/IF/THEN/GOTO/FOR/READ/DATA)",
+    "vol": "vol                   disk volume info",
+}
+
     def _cmd_help(self, args):
+        topic = args[0] if args else None
+        if topic:
+            lines = [
+                "YUshiveLinux manuals",
+                "===================",
+            ]
+            if topic in self.HELP_TOPICS:
+                lines.append(self.HELP_TOPICS[topic])
+            elif topic in VENV.aliases:
+                lines.append(f"alias {topic} = {VENV.aliases[topic]}  (it is a blessing)")
+            else:
+                lines.append(f"no manual entry for {topic}  (try 'help')")
+            self.text.insert(tk.END, "\n".join(lines) + "\n")
+            self._insert_prompt()
+            return
+
         lines = [
             "YUshiveLinux Shell  -  the Toy CLI",
             "======================================",
@@ -867,7 +1228,8 @@ class YumeTerminal(tk.Frame):
             "   pwd                   print working directory",
             "   mkdir <path>          make directory",
             "   rmdir <path>          remove empty directory",
-            "   rm <path>             remove file",
+            "   rm <path>             remove file (to the Recycle Bin)",
+            "   restore <name>        get it back from the Bin",
             "   touch <path>          create empty file",
             "   mv <src> <dst>        move/rename",
             "   cp <src> <dst>        copy",
@@ -876,12 +1238,29 @@ class YumeTerminal(tk.Frame):
             "   find <name> [path]    search files",
             "   tree [path]           show tree",
             "   df                    disk usage",
+            "   du [path]             size of a path",
             "   file <path>           identify file",
+            "   ln <src> <dst>        symbolic link",
+            "   chmod <octal> <path>  change permissions",
+            "   stat <path>           inode, blocks, and blessings",
+"   edit <file>           open YumePad",
+             "   run <file>            run a script file",
+             " PROGRAMMING",
+             "   holyc <file.hc>        mini-C interpreter (Print/if/for/while/functions)",
+             "   lisp <file.lsp>|expr   Scheme-style interpreter",
+             "   basic <file.bas>       Yiddish BASIC (numbered lines)",
+             " PACKAGES",
+             "   siddur search|info|install|list|remove|publish|import",
+             "   pkg = siddur           (alias)",
+             " SHELL",
+            "   sudo <cmd>  env  export KEY=val  alias  unalias",
+            "   help [cmd]  man [cmd]  history (?): use Up/Down",
             " SYSTEM (FAKE)",
             "   whoami  hostname  uname  date",
             "   uptime  vol       firstboot  neofetch",
-            "   clear   help      exit  reboot",
-            "   oy      shabbat",
+            "   clear   exit      reboot  shutdown",
+            "   screensaver  ps  weather  panic",
+            "   oy  shabbat  brocha  god  gematria",
             "",
             " Pro tip: press TAB to complete commands and file names.",
             " All file operations live in a virtual filesystem.",
@@ -952,14 +1331,29 @@ class YumeTerminal(tk.Frame):
                     kind = "D" if e.type == "dir" else "-"
                     name = e.name + "/" if e.type == "dir" else e.name
                     mtime = e.mtime.strftime("%b %d %H:%M")
-                    self.text.insert(tk.END, f"{kind} {e.perms} {e.size:>8} {mtime}  {name}\n")
+                    tag = "dir" if e.type == "dir" else self._ls_tag(e)
+                    self.text.insert(tk.END, f"{kind} {e.perms} {e.size:>8} {mtime}  {name}\n", tag)
             else:
                 display = []
                 for e in entries:
-                    display.append(e.name + "/" if e.type == "dir" else e.name)
+                    display.append((e.name + "/" if e.type == "dir" else e.name, self._ls_tag(e)))
                 for i in range(0, len(display), 5):
-                    self.text.insert(tk.END, "  ".join(display[i:i+5]) + "\n")
+                    chunk = display[i:i+5]
+                    for j, (name, tag) in enumerate(chunk):
+                        self.text.insert(tk.END, name, tag)
+                        if j < len(chunk) - 1:
+                            self.text.insert(tk.END, "  ")
+                    self.text.insert(tk.END, "\n")
         self._insert_prompt()
+
+    def _ls_tag(self, e):
+        if e.type == "dir":
+            return "dir"
+        if e.locked or e.perms.endswith("x"):
+            return "execfile"
+        if e.name.startswith("."):
+            return "hidden"
+        return None
 
     def _cmd_mkdir(self, args):
         if not args:
@@ -993,19 +1387,20 @@ class YumeTerminal(tk.Frame):
 
     def _cmd_rm(self, args):
         if not args:
-            self.text.insert(tk.END, "rm: missing operand\n")
+            self.text.insert(tk.END, "rm: missing operand\n", "error")
             self._insert_prompt()
             return
         for p in args:
             node = VFS.resolve(p, self.cwd)
             if node is None:
-                self.text.insert(tk.END, f"rm: {p}: no such file or directory\n")
+                self.text.insert(tk.END, f"rm: {p}: no such file or directory\n", "error")
             elif node.type == "dir":
-                self.text.insert(tk.END, f"rm: {p}: is a directory (use rmdir)\n")
+                self.text.insert(tk.END, f"rm: {p}: is a directory (use rmdir)\n", "error")
             else:
-                rc = VFS.rm(p, self.cwd)
+                rc = VFS.trash(p, self.cwd)
                 if rc == "EPROTECT":
-                    self.text.insert(tk.END, f"rm: {p}: protected by HaShem\n")
+                    beep()
+                    self.text.insert(tk.END, f"rm: {p}: protected by HaShem (or locked by chmod 000)\n", "error")
         self._insert_prompt()
 
     def _cmd_touch(self, args):
@@ -1080,10 +1475,10 @@ class YumeTerminal(tk.Frame):
             if idx + 1 < len(parts):
                 redirect = parts[idx + 1]
 
-        text = " ".join(text_parts)
+        text = self._expand_env(" ".join(text_parts))
 
         if args and args[0] == "-n":
-            text = " ".join(args[1:]) if ">" not in args else text
+            text = self._expand_env(" ".join(args[1:])) if ">" not in args else text
             if redirect:
                 rc = VFS.write(redirect, text + "\n", self.cwd)
                 if rc:
@@ -1230,6 +1625,508 @@ class YumeTerminal(tk.Frame):
         ))
         self._insert_prompt()
 
+    # ---- the new wave of builtins ----------------------------------------
+    def _cmd_edit(self, args):
+        if not args:
+            self.text.insert(tk.END, "edit: missing operand\n", "error")
+            self._insert_prompt()
+            return
+        parent_win = self._get_gui_parent()
+        if parent_win is None:
+            self.text.insert(tk.END, "edit: no GUI to edit in\n", "error")
+            self._insert_prompt()
+            return
+        path = args[0]
+        node = VFS.resolve(path, self.cwd)
+        if node is None:
+            self.text.insert(tk.END, f"edit: {path}: no such file\n", "error")
+            self._insert_prompt()
+            return
+        if node.type == "dir":
+            self.text.insert(tk.END, f"edit: {path}: is a directory (a Rebbe always has a chumash)\n", "error")
+            self._insert_prompt()
+            return
+        parent_win.open_editor(VFS._path_of(node))
+
+    def _cmd_chmod(self, args):
+        if len(args) != 2:
+            self.text.insert(tk.END, "chmod: usage: chmod <octal> <path>  (000 locks the file)\n", "error")
+            self._insert_prompt()
+            return
+        rc = VFS.chmod(args[1], args[0], self.cwd)
+        if rc == "ENOENT":
+            self.text.insert(tk.END, f"chmod: {args[1]}: no such file or directory\n", "error")
+        elif rc == "EINVAL":
+            self.text.insert(tk.END, f"chmod: {args[0]}: invalid mode (try 755 or 000)\n", "error")
+        self._insert_prompt()
+
+    def _cmd_stat(self, args):
+        if not args:
+            self.text.insert(tk.END, "stat: missing operand\n", "error")
+            self._insert_prompt()
+            return
+        for p in args:
+            node = VFS.resolve(p, self.cwd)
+            if node is None:
+                self.text.insert(tk.END, f"stat: {p}: cannot stat\n", "error")
+                continue
+            full = VFS._path_of(node)
+            blocks = max(node.size // 512 + 1, 1) if node.type != "dir" else 0
+            lock = "locked (protected by HaShem)" if node.locked else "unlocked"
+            self.text.insert(tk.END, (
+                f"  File: {full}\n"
+                f"  Type: {node.type}    Size: {node.size}    Blocks: {blocks}\n"
+                f"  Perms: {node.perms}    {lock}\n"
+                f"  Inode: {node.inode}    Modified: {node.mtime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"  Blessed by: the Rebbe's Machine\n"
+            ))
+        self._insert_prompt()
+
+    def _cmd_ln(self, args):
+        if len(args) != 2:
+            self.text.insert(tk.END, "ln: usage: ln <src> <dst>\n", "error")
+            self._insert_prompt()
+            return
+        rc = VFS.ln(args[0], args[1], self.cwd)
+        if rc == "ENOENT":
+            self.text.insert(tk.END, f"ln: {args[0]}: no such file or directory\n", "error")
+        elif rc == "EEXIST":
+            self.text.insert(tk.END, f"ln: {args[1]}: already exists\n", "error")
+        self._insert_prompt()
+
+    def _cmd_readlink(self, args):
+        if not args:
+            self.text.insert(tk.END, "readlink: missing operand\n", "error")
+            self._insert_prompt()
+            return
+        for p in args:
+            node = VFS.resolve(p, self.cwd)
+            if node is None:
+                self.text.insert(tk.END, f"readlink: {p}: no such file\n", "error")
+            elif node.content.startswith("LINK:"):
+                self.text.insert(tk.END, node.content[5:] + "\n")
+            else:
+                self.text.insert(tk.END, f"readlink: {p}: not a symbolic link\n", "error")
+        self._insert_prompt()
+
+    def _cmd_du(self, args):
+        start = args[0] if args else "."
+        base = self.cwd if start == "." else start
+        node = VFS.resolve(start, self.cwd)
+        if node is None:
+            self.text.insert(tk.END, f"du: {start}: no such path\n", "error")
+            self._insert_prompt()
+            return
+        for path, n, _ in VFS.walk(self.cwd if start == "." else start, self.cwd):
+            if n.type == "dir":
+                sz = VFS.du(path, self.cwd)
+                self.text.insert(tk.END, f"{sz:>8}  {path}\n")
+        sz = VFS.du(base, self.cwd)
+        self.text.insert(tk.END, f"{sz:>8}  {base} (total)\n")
+        self._insert_prompt()
+
+    def _cmd_sudo(self, args):
+        if not args:
+            self.text.insert(tk.END, "sudo: the Rebbe is already root. Everywhere is root.\n")
+            self._insert_prompt()
+            return
+        self.text.insert(tk.END, "[sudo] password for rebbe: ******** (it was always empty)\n", "dim")
+        self._execute(" ".join(args))
+
+    def _cmd_env(self, args):
+        for k in sorted(VENV.env):
+            self.text.insert(tk.END, f"{k}={VENV.env[k]}\n")
+        self._insert_prompt()
+
+    def _cmd_export(self, args):
+        if not args:
+            self._cmd_env(args)
+            return
+        for a in args:
+            if "=" in a:
+                k, v = a.split("=", 1)
+                VENV.env[k] = v
+        _save_conf()
+        self._insert_prompt()
+
+    def _cmd_alias(self, args):
+        if not args:
+            for k, v in VENV.aliases.items():
+                self.text.insert(tk.END, f"alias {k}='{v}'\n")
+            self._insert_prompt()
+            return
+        for a in args:
+            if "=" in a:
+                k, v = a.split("=", 1)
+                VENV.aliases[k.strip()] = v.strip()
+        _save_conf()
+        self._insert_prompt()
+
+    def _cmd_unalias(self, args):
+        if not args:
+            self.text.insert(tk.END, "unalias: missing operand\n", "error")
+            self._insert_prompt()
+            return
+        for a in args:
+            VENV.aliases.pop(a, None)
+        _save_conf()
+        self._insert_prompt()
+
+    def _run_script(self, content):
+        out = []
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("//") or line.startswith("#"):
+                continue
+            low = line.replace(" ", "")
+            if low.startswith("U0") or low.startswith("I64") or low in ("{", "}"):
+                continue
+            if line.startswith("Sleep"):
+                continue
+            for text in self._extract_quoted(line):
+                out.append(self._expand_env(text))
+            if len(out) > 200:
+                break
+        return out
+
+    @staticmethod
+    def _extract_quoted(line):
+        out = []
+        i = 0
+        while i < len(line):
+            if line[i] == '"':
+                i += 1
+                buf = []
+                while i < len(line) and line[i] != '"':
+                    if line[i:i+2] == "\\n":
+                        buf.append("\n")
+                        i += 2
+                    else:
+                        buf.append(line[i])
+                        i += 1
+                out.append("".join(buf))
+            i += 1
+        return out
+
+    def _cmd_run(self, args):
+        if not args:
+            self.text.insert(tk.END, "run: missing operand (try run /System/FirstBoot.HC)\n", "error")
+            self._insert_prompt()
+            return
+        path = args[0]
+        node = VFS.resolve(path, self.cwd)
+        if node is None:
+            self.text.insert(tk.END, f"run: {path}: no such file\n", "error")
+            self._insert_prompt()
+            return
+        if node.type == "dir":
+            self.text.insert(tk.END, f"run: {path}: is a directory\n", "error")
+            self._insert_prompt()
+            return
+        if path.lower().endswith(".hc"):
+            for text in self._run_holyc(node.content):
+                self.text.insert(tk.END, text + "\n")
+        else:
+            for text in self._run_script(node.content):
+                self.text.insert(tk.END, text + "\n")
+        self._insert_prompt()
+
+    def _cmd_ps(self, args):
+        self.text.insert(tk.END, "PID   CMD                           CPU      MEM\n")
+        procs = [
+            (1, "kugeld", "0.0%", "1M"),
+            (2, "meshugas", "74%", "64K"),
+            (3, "havdalah-daemon", "1.0%", "2K"),
+            (4, "nachas (zombie)", "0.0%", "0K"),
+            (5, "siddur-package-manager", "12%", "4K"),
+            (6, f"yumesh (rebbe@{VENV.hostname})", "3%", "640K"),
+        ]
+        for pid, name, cpu, mem in procs:
+            self.text.insert(tk.END, f"{pid:<5} {name:<29} {cpu:<8} {mem}\n")
+        self.text.insert(tk.END, "6 processes; 1 cpu (74-MHz, unclamped, like the clock in shul)\n", "dim")
+        self._insert_prompt()
+
+    def _cmd_weather(self, args):
+        self.text.insert(tk.END, (
+            "Jerusalem Report (hashgachah reception: good)\n"
+            "Forecast: partly cloudy, with a chance of gefilte fish.\n"
+            "Humidity: a little klotsky. Wind: southerly, like the family.\n"
+            "Tomorrow: brisky, but the sun will shine like a candelabra.\n"
+        ))
+        self._insert_prompt()
+
+    def _cmd_panic(self, args):
+        self.text.insert(tk.END, "panic: The Rebbe panics. It is a good thing.\n", "error")
+        parent_win = self._get_gui_parent()
+        if parent_win:
+            parent_win.show_panic()
+        else:
+            self._insert_prompt()
+
+    def _cmd_gematria(self, args):
+        if not args:
+            self.text.insert(tk.END, "gematria: usage: gematria <word>\n", "error")
+            self._insert_prompt()
+            return
+        word = args[0].lower()
+        val = sum(ord(c) - ord("a") + 1 for c in word if c.isalpha())
+        self.text.insert(tk.END, f"The word '{args[0]}' equals {val} in gematria. Blessed is the computation.\n")
+        if val == 613:
+            self.text.insert(tk.END, "Aha! 613! The number of mitzvot. You may be the compiler.\n", "dir")
+        self._insert_prompt()
+
+    def _cmd_brocha(self, args):
+        bless = random.choice([
+            "Baruch HaShem for this blessed day of computing.",
+            "Blessed art thou, who strengthens the CPU and gives recipe-blessings.",
+            "May the stack never overflow, and your cholent overflow.",
+            "How lovely is the complex; the accumulator is a pleasant companion.",
+            "Blessed is the pointer that returns, and the loop that closes.",
+        ])
+        self.text.insert(tk.END, bless + "\n")
+        self._insert_prompt()
+
+    def _cmd_god(self, args):
+        self.text.insert(tk.END, "There is one God. And one compiler. (There may be many buses.)\n")
+        self._insert_prompt()
+
+    def _cmd_shutdown(self, args):
+        parent_win = self._get_gui_parent()
+        if parent_win:
+            parent_win.trigger_shutdown()
+        else:
+            self._insert_prompt()
+
+    def _cmd_screensaver(self, args):
+        parent_win = self._get_gui_parent()
+        if parent_win:
+            parent_win.start_screensaver(force=True)
+        self._insert_prompt()
+
+    def _cmd_restore(self, args):
+        if not args:
+            self.text.insert(tk.END, "restore: usage: restore <name>\n", "error")
+            self._insert_prompt()
+            return
+        for a in args:
+            rc = VFS.restore(a, self.cwd)
+            if rc == "ENOENT":
+                self.text.insert(tk.END, f"restore: {a}: not in the Recycle Bin\n", "error")
+            else:
+                self.text.insert(tk.END, f"restore: {a} has returned home.\n")
+        self._insert_prompt()
+
+    # ---- packages & languages --------------------------------------------
+    def _run_holyc(self, content):
+        out = []
+        state = {"err": None}
+
+        def err(s):
+            state["err"] = s
+
+        eng = HolyCEngine(on_out=lambda s: out.append(s) if state["err"] is None else None, on_error=err)
+        eng.run_source(content)
+        if state["err"]:
+            return self._run_script(content)
+        return out
+
+    def _run_script_file(self, path):
+        node = VFS.resolve(path, self.cwd)
+        if node is None:
+            self.text.insert(tk.END, f"yumesh: {path}: no such file\n", "error")
+            self._insert_prompt()
+            return
+        if node.type == "dir":
+            self.text.insert(tk.END, f"yumesh: {path}: is a directory\n", "error")
+            self._insert_prompt()
+            return
+        content = node.content
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext == "hc":
+            for text in self._run_holyc(content):
+                self.text.insert(tk.END, text + "\n")
+        elif ext == "lsp":
+            lisp = LispInterpreter(
+                on_out=lambda s: self.text.insert(tk.END, s + "\n"),
+                on_error=lambda s: self.text.insert(tk.END, s + "\n", "error"),
+            )
+            lisp.run(content)
+        elif ext == "bas":
+            basic = BasicInterpreter(
+                on_out=lambda s: self.text.insert(tk.END, s + "\n"),
+                on_error=lambda s: self.text.insert(tk.END, s + "\n", "error"),
+            )
+            basic.run_source(content)
+        else:
+            for text in self._run_script(content):
+                self.text.insert(tk.END, text + "\n")
+        self._insert_prompt()
+
+    def _package_command(self, name):
+        return Siddur.command_path(name)
+
+    def _cmd_holyc(self, args):
+        if not args:
+            self.text.insert(tk.END, "holyc: usage: holyc <file.hc>   (try holyc /System/FirstBoot.HC)\n", "error")
+            self._insert_prompt()
+            return
+        self._run_script_file(args[0])
+
+    def _cmd_lisp(self, args):
+        if not args:
+            self.text.insert(tk.END, "lisp: usage: lisp <file.lsp>  |  lisp '<expression>'\n", "error")
+            self._insert_prompt()
+            return
+        first = args[0]
+        node = VFS.resolve(first, self.cwd)
+        if node is not None and node.type == "file":
+            self._run_script_file(first)
+            return
+        lisp = LispInterpreter(
+            on_out=lambda s: self.text.insert(tk.END, s + "\n"),
+            on_error=lambda s: self.text.insert(tk.END, s + "\n", "error"),
+        )
+        lisp.run(" ".join(args))
+        self._insert_prompt()
+
+    def _cmd_basic(self, args):
+        if not args:
+            self.text.insert(tk.END, "basic: usage: basic <file.bas>\n", "error")
+            self._insert_prompt()
+            return
+        self._run_script_file(args[0])
+
+    def _cmd_siddur(self, args):
+        if not args:
+            self.text.insert(tk.END, (
+                "siddur - the package manager of YUshiveOS\n"
+                "  siddur search [query]    list packages from the registry\n"
+                "  siddur info <name>       show package details\n"
+                "  siddur install <name>    install a package\n"
+                "  siddur list              show installed packages\n"
+                "  siddur remove <name>     retire a package (to the Bin)\n"
+                "  siddur publish <dir>     bundle a directory into a .pkg\n"
+                "  siddur import <file.pkg> install a shared .pkg\n"
+                "  siddur update            (offline siddur: the vineyard is yours)\n"
+            ), "title")
+            self._insert_prompt()
+            return
+        sub = args[0]
+        rest = args[1:]
+        if sub == "search":
+            rows = Siddur.search(self, rest[0] if rest else None)
+            if not rows:
+                self.text.insert(tk.END, "siddur search: nothing found in the registry.\n", "dim")
+            else:
+                self.text.insert(tk.END, f"{len(rows)} package(s) available:\n")
+                for name, ver, cat, desc in rows:
+                    self.text.insert(tk.END, f"  {name:<16} {cat:<8} v{ver:<5} {desc}\n")
+            self._insert_prompt()
+            return
+        if sub == "info":
+            if not rest:
+                self.text.insert(tk.END, "siddur info: usage: siddur info <name>\n", "error")
+                self._insert_prompt()
+                return
+            name = rest[0]
+            pkg = _DEMO_PACKAGES.get(name)
+            if pkg is None:
+                self.text.insert(tk.END, f"siddur info: {name}: no such package in the registry.\n", "error")
+                self._insert_prompt()
+                return
+            self.text.insert(tk.END, (
+                f"  {name}  v{pkg['version']}  by {pkg['author']}\n"
+                f"  category: {pkg['category']}   entry: {pkg['entry']}   command: {pkg.get('cmd') or name}\n"
+                f"  {pkg['desc']}\n"
+            ))
+            self._insert_prompt()
+            return
+        if sub == "install":
+            if not rest:
+                self.text.insert(tk.END, "siddur install: usage: siddur install <name>\n", "error")
+                self._insert_prompt()
+                return
+            name = rest[0]
+            rc = Siddur.install(self, name)
+            if rc == "ENOENT":
+                self.text.insert(tk.END, f"siddur install: {name}: no such package. Try 'siddur search'.\n", "error")
+            elif rc == "EEXIST":
+                self.text.insert(tk.END, f"siddur install: {name}: already installed.\n", "error")
+            else:
+                self.text.insert(tk.END, f"siddur: {name} installed to {PKG_ROOT}/{name}.\n"
+                                       f"  Type '{name}' to run it, or 'siddur list'.\n")
+            self._insert_prompt()
+            return
+        if sub == "list":
+            inst = Siddur.installed()
+            if not inst:
+                self.text.insert(tk.END, "no packages installed yet. Try a blessing, and 'siddur search'.\n", "dim")
+            else:
+                for name, meta in inst:
+                    ver = meta.get("version", "?")
+                    cmd = meta.get("cmd") or name
+                    cat = meta.get("category", "?")
+                    self.text.insert(tk.END, f"  {name:<16} {cat:<8} v{ver:<5} cmd: {cmd}\n")
+            self._insert_prompt()
+            return
+        if sub == "remove":
+            if not rest:
+                self.text.insert(tk.END, "siddur remove: usage: siddur remove <name>\n", "error")
+                self._insert_prompt()
+                return
+            name = rest[0]
+            rc = Siddur.remove(self, name)
+            if rc == "ENOENT":
+                self.text.insert(tk.END, f"siddur remove: {name}: not installed.\n", "error")
+            elif rc == "EPROTECT":
+                self.text.insert(tk.END, f"siddur remove: {name}: protected by a shomer.\n", "error")
+            else:
+                self.text.insert(tk.END, f"siddur: {name} removed. It rests in the Recycle Bin.\n")
+            self._insert_prompt()
+            return
+        if sub == "publish":
+            if not rest:
+                self.text.insert(tk.END, "siddur publish: usage: siddur publish <directory>\n", "error")
+                self._insert_prompt()
+                return
+            rc = Siddur.publish(self, rest[0])
+            if rc == "ENOENT":
+                self.text.insert(tk.END, f"siddur publish: {rest[0]}: no such directory.\n", "error")
+            elif rc == "EMPTY":
+                self.text.insert(tk.END, "siddur publish: nothing to bundle in that directory.\n", "error")
+            else:
+                vfs_path, real = rc
+                self.text.insert(tk.END, f"siddur publish: bundled to {vfs_path}\n")
+                if real:
+                    self.text.insert(tk.END, f"  Share it: the portable copy is at {real}\n")
+                    self.text.insert(tk.END, "  Friends install it with:  siddur import <file.pkg>\n")
+                else:
+                    self.text.insert(tk.END, "  (real export dir unavailable; the VFS copy will do)\n")
+            self._insert_prompt()
+            return
+        if sub == "import":
+            if not rest:
+                self.text.insert(tk.END, "siddur import: usage: siddur import <file.pkg>\n", "error")
+                self._insert_prompt()
+                return
+            rc = Siddur.import_pkg(self, rest[0])
+            if rc == "ENOENT":
+                self.text.insert(tk.END, f"siddur import: {rest[0]}: no such file.\n", "error")
+            elif rc == "EBAD":
+                self.text.insert(tk.END, "siddur import: not a valid .pkg bundle.\n", "error")
+            elif rc == "EEXIST":
+                self.text.insert(tk.END, "siddur import: that package is already installed.\n", "error")
+            else:
+                self.text.insert(tk.END, "siddur import: package installed. Share it, and be shared.\n")
+            self._insert_prompt()
+            return
+        if sub == "update":
+            self.text.insert(tk.END, "siddur update: this siddur is offline-only; the vineyard is yours.\n", "dim")
+            self._insert_prompt()
+            return
+        self.text.insert(tk.END, f"siddur: unknown subcommand '{sub}'  (try 'siddur' alone)\n", "error")
+        self._insert_prompt()
+
     def _display_firstboot(self):
         self.text.insert(tk.END, (
             "*** YUshiveOS First Boot ***\n"
@@ -1248,6 +2145,1302 @@ class YumeTerminal(tk.Frame):
                 return p
             p = p.master
         return None
+
+
+# ============================================================================
+# HolyC-lite: a tiny C-ish interpreter for .HC scripts (on the simmer)
+# ============================================================================
+class HolyCError(Exception):
+    pass
+
+
+class _ReturnSignal(Exception):
+    def __init__(self, value=0):
+        super().__init__()
+        self.value = value
+
+
+_PREC = {"||": 1, "&&": 2, "==": 3, "!=": 3, "<": 4, "<=": 4, ">": 4, ">=": 4,
+         "+": 5, "-": 5, "*": 6, "/": 6, "%": 6}
+_TYPES = ("I64", "U0", "U8", "U16", "U32")
+
+
+def _expr_tokens(s):
+    toks = []
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch.isspace():
+            i += 1
+        elif ch.isdigit():
+            j = i
+            while j < n and (s[j].isdigit() or s[j] == "_"):
+                j += 1
+            toks.append(("num", int(s[i:j].replace("_", ""))))
+            i = j
+        elif ch.isalpha() or ch == "_":
+            j = i
+            while j < n and (s[j].isalnum() or s[j] == "_"):
+                j += 1
+            toks.append(("id", s[i:j]))
+            i = j
+        elif ch == '"':
+            j = i + 1
+            buf = []
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n:
+                    esc = s[j + 1]
+                    buf.append("\n" if esc == "n" else esc)
+                    j += 2
+                else:
+                    buf.append(s[j])
+                    j += 1
+            toks.append(("str", "".join(buf)))
+            i = j + 1
+        else:
+            two = s[i:i + 2]
+            if two in ("==", "!=", "<=", ">=", "&&", "||"):
+                toks.append(("op", two))
+                i += 2
+            elif two in ("+=", "-=", "*=", "/=", "%=", "++", "--"):
+                toks.append(("op", two))
+                i += 2
+            else:
+                toks.append(("op", ch))
+                i += 1
+    return toks
+
+
+def _expr_prefix(toks, i):
+    if i >= len(toks):
+        raise HolyCError("unexpected end of expression")
+    kind, val = toks[i]
+    if kind in ("num", "str"):
+        return (kind, val), i + 1
+    if kind == "id":
+        if i + 1 < len(toks) and toks[i + 1] == ("op", "("):
+            j = i + 2
+            args = []
+            if j < len(toks) and toks[j] != ("op", ")"):
+                while True:
+                    a, j = _expr_parse(toks, j)
+                    args.append(a)
+                    if j < len(toks) and toks[j] == ("op", ","):
+                        j += 1
+                    else:
+                        break
+            if j < len(toks) and toks[j] == ("op", ")"):
+                j += 1
+            return ("call", val, args), j
+        return ("var", val), i + 1
+    if kind == "op" and val == "(":
+        node, j = _expr_parse(toks, i + 1)
+        if j < len(toks) and toks[j] == ("op", ")"):
+            j += 1
+        return node, j
+    if kind == "op" and val == "-":
+        node, j = _expr_parse(toks, i + 1, 7)
+        return ("neg", node), j
+    if kind == "op" and val == "!":
+        node, j = _expr_parse(toks, i + 1, 7)
+        return ("not", node), j
+    raise HolyCError(f"bad token '{val}'")
+
+
+def _expr_parse(toks, i=0, min_prec=0):
+    node, j = _expr_prefix(toks, i)
+    while j < len(toks):
+        kind, val = toks[j]
+        if kind != "op" or val not in _PREC or _PREC[val] < min_prec:
+            break
+        j += 1
+        right, j = _expr_parse(toks, j, _PREC[val] + 1)
+        node = ("bin", val, node, right)
+    return node, j
+
+
+def _expr_eval(node, getvar=None, call=None, tick=None):
+    if tick:
+        tick()
+    if node is None:
+        return 0
+    t = node[0]
+    if t == "num":
+        return node[1]
+    if t == "str":
+        return node[1]
+    if t == "var":
+        name = node[1]
+        if getvar is not None:
+            v = getvar(name)
+            if v is not None:
+                return v
+        raise HolyCError(f"undefined identifier '{name}'")
+    if t == "neg":
+        return -_expr_eval(node[1], getvar, call, tick)
+    if t == "not":
+        return 0 if _expr_eval(node[1], getvar, call, tick) else 1
+    if t == "call":
+        name, args = node[1], node[2]
+        vals = [_expr_eval(a, getvar, call, tick) for a in args]
+        if call is not None:
+            return call(name, vals)
+        raise HolyCError(f"undefined function '{name}'")
+    op, a, b = node[1], node[2], node[3]
+    av = _expr_eval(a, getvar, call, tick)
+    if op == "&&":
+        return av and _expr_eval(b, getvar, call, tick)
+    if op == "||":
+        return av or _expr_eval(b, getvar, call, tick)
+    bv = _expr_eval(b, getvar, call, tick)
+    if op == "+":
+        if isinstance(av, str) or isinstance(bv, str):
+            return str(av) + str(bv)
+        return av + bv
+    for bad in (av, bv):
+        if not isinstance(bad, int):
+            raise HolyCError("arithmetic wants integers")
+    if op == "-":
+        return av - bv
+    if op == "*":
+        return av * bv
+    if op == "/":
+        return av // bv if bv else 0
+    if op == "%":
+        return av % bv if bv else 0
+    if op == "==":
+        return 1 if av == bv else 0
+    if op == "!=":
+        return 1 if av != bv else 0
+    if op == "<":
+        return 1 if av < bv else 0
+    if op == "<=":
+        return 1 if av <= bv else 0
+    if op == ">":
+        return 1 if av > bv else 0
+    if op == ">=":
+        return 1 if av >= bv else 0
+    return 0
+
+
+def _split_top(toks, sep):
+    out, cur, depth = [], [], 0
+    for t in toks:
+        if t == ("op", "("):
+            depth += 1
+        elif t == ("op", ")"):
+            depth -= 1
+        if t == ("op", sep) and depth == 0:
+            out.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    out.append(cur)
+    return out
+
+
+class HolyCEngine:
+    MAX_STEPS = 20000
+    MAX_DEPTH = 64
+
+    def __init__(self, on_out=None, on_error=None):
+        self.out = on_out or (lambda s: None)
+        self.err = on_error or self.out
+        self.defs = {}
+        self.globals = {}
+        self.frames = []
+        self.steps = 0
+        self.depth = 0
+        self.lines = []
+        self.pos = 0
+
+    def _tick(self):
+        self.steps += 1
+        if self.steps > self.MAX_STEPS:
+            raise HolyCError("too many steps (the golem struck back)")
+
+    def _scope(self):
+        return self.frames[-1] if self.frames else self.globals
+
+    def _getvar(self, name):
+        for fr in reversed(self.frames):
+            if name in fr:
+                return fr[name]
+        if name in self.globals:
+            return self.globals[name]
+        return None
+
+    def _setvar(self, name, val):
+        for fr in reversed(self.frames):
+            if name in fr:
+                fr[name] = val
+                return
+        self.globals[name] = val
+
+    def run_source(self, content):
+        self.lines = content.splitlines()
+        self.pos = 0
+        try:
+            while self.pos < len(self.lines):
+                self._run_line()
+        except HolyCError as e:
+            self.err(f"holyc: {e}")
+        except _ReturnSignal:
+            pass
+
+    def _strip(self, line):
+        out = []
+        i, n = 0, len(line)
+        in_str = False
+        while i < n:
+            ch = line[i]
+            if ch == '"':
+                in_str = not in_str
+                out.append(ch)
+            elif not in_str and line.startswith("//", i):
+                break
+            else:
+                out.append(ch)
+            i += 1
+        return "".join(out)
+
+    def _peek_stripped(self):
+        if self.pos >= len(self.lines):
+            return ""
+        return self._strip(self.lines[self.pos]).strip()
+
+    def _match_brace(self):
+        balance = 0
+        i = self.pos
+        while i < len(self.lines):
+            s = self.lines[i]
+            balance += s.count("{") - s.count("}")
+            if balance <= 0:
+                return i
+            i += 1
+        raise HolyCError("unbalanced braces")
+
+    def _match_from(self, start):
+        balance = 0
+        i = start
+        while i < len(self.lines):
+            balance += self.lines[i].count("{") - self.lines[i].count("}")
+            if balance <= 0:
+                return i
+            i += 1
+        raise HolyCError(f"unbalanced braces from line {start + 1}")
+
+    def _ensure_brace(self, rest):
+        if "{" not in rest:
+            while True:
+                self.pos += 1
+                if self.pos >= len(self.lines):
+                    raise HolyCError("missing '{'")
+                nxt = self.lines[self.pos].strip()
+                if nxt and "{" in nxt:
+                    return
+
+    def _run_line(self):
+        if self.pos >= len(self.lines):
+            return
+        raw = self.lines[self.pos]
+        s = self._strip(raw).strip().rstrip(";").strip()
+        if not s or s in ("{", "}"):
+            self.pos += 1
+            return
+        if s.startswith("#"):
+            self.pos += 1
+            return
+        m = re.match(r"^(?:U0|I64|U8|U16|U32)\s+(\w+)\s*\(([^)]*)\)\s*", s)
+        if m:
+            self._parse_function(m, s)
+            return
+        if s.startswith("if "):
+            self._run_if(s)
+            return
+        if s.startswith("for "):
+            self._run_for(s)
+            return
+        if s.startswith("while "):
+            self._run_while(s)
+            return
+        if re.match(r"^return\b", s):
+            self.pos += 1
+            node, _ = _expr_parse(_expr_tokens(s[len("return"):].lstrip()))
+            raise _ReturnSignal(_expr_eval(node, self._getvar, self._call, self._tick))
+        if re.match(r"^print(?:ln)?\b", s, re.IGNORECASE):
+            self._run_print(s)
+            return
+        if re.match(r"^Sleep\b", s, re.IGNORECASE):
+            m = re.match(r"^Sleep\s*\((.*)\)\s*$", s, re.IGNORECASE)
+            if m:
+                node, _ = _expr_parse(_expr_tokens(m.group(1)))
+                _expr_eval(node, self._getvar, self._call, self._tick)
+            self.pos += 1
+            return
+        if self._maybe_assign(s):
+            return
+        if s.startswith('"'):
+            self.pos += 1
+            node, _ = _expr_parse(_expr_tokens(s))
+            self.out(str(_expr_eval(node, self._getvar, self._call, self._tick)))
+            return
+        try:
+            node, j = _expr_parse(_expr_tokens(s))
+            if j >= len(_expr_tokens(s)):
+                _expr_eval(node, self._getvar, self._call, self._tick)
+                self.pos += 1
+                return
+        except HolyCError:
+            pass
+        raise HolyCError(f"can't parse: '{s}' (line {self.pos + 1})")
+
+    def _parse_function(self, m, s):
+        name = m.group(1)
+        params = [p.split()[-1] for p in m.group(2).split(",") if p.strip()]
+        rest = s[m.end():]
+        if "{" not in rest:
+            while True:
+                self.pos += 1
+                if self.pos >= len(self.lines):
+                    raise HolyCError(f"function '{name}' missing '{{'")
+                if "{" in self.lines[self.pos]:
+                    break
+        self.defs[name] = (params, self.pos)
+        self.pos = self._match_brace() + 1
+
+    def _call(self, name, vals):
+        if name == "Sleep":
+            return 0
+        d = self.defs.get(name)
+        if d is None:
+            raise HolyCError(f"undefined function '{name}'")
+        if self.depth >= self.MAX_DEPTH:
+            raise HolyCError("call depth exceeds the shtender")
+        self.depth += 1
+        try:
+            params, body_start = d
+            close = self._match_from(body_start)
+            fr = {}
+            for p, v in zip(params, vals):
+                fr[p] = v
+            self.frames.append(fr)
+            saved = self.pos
+            self.pos = body_start + 1
+            result = 0
+            try:
+                while self.pos < close:
+                    self._run_line()
+            except _ReturnSignal as ret:
+                result = ret.value
+            self.pos = saved
+            return result
+        finally:
+            self.frames.pop()
+            self.depth -= 1
+
+    def _run_print(self, s):
+        m = re.match(r"^print(?:ln)?\s*\(?(.*)$", s, re.IGNORECASE)
+        args_text = m.group(1).strip()
+        if args_text.endswith(")"):
+            args_text = args_text[:-1]
+        pieces = []
+        for tl in _split_top(_expr_tokens(args_text), ","):
+            if not tl:
+                continue
+            node, _ = _expr_parse(tl)
+            pieces.append(str(_expr_eval(node, self._getvar, self._call, self._tick)))
+        self.out("".join(pieces))
+        self.pos += 1
+
+    def _maybe_assign(self, s):
+        tl = _expr_tokens(s)
+        if not tl:
+            return False
+        if len(tl) == 2 and tl[0][0] == "id" and tl[0][1] in _TYPES and tl[1][0] == "id":
+            self._setvar(tl[1][1], 0)
+            self.pos += 1
+            return True
+        if self._assign_toks(tl, s):
+            self.pos += 1
+            return True
+        return False
+
+    def _assign_toks(self, tl, src=None):
+        if not tl:
+            return False
+        if len(tl) >= 4 and tl[0][0] == "id" and tl[0][1] in _TYPES and tl[1][0] == "id" and tl[2] == ("op", "="):
+            name, i = tl[1][1], 3
+        elif len(tl) >= 3 and tl[0][0] == "id" and tl[1] == ("op", "="):
+            name, i = tl[0][1], 2
+        elif len(tl) >= 2 and tl[0][0] == "id" and tl[1] == ("op", "++"):
+            self._setvar(tl[0][1], self._getvar(tl[0][1]) + 1)
+            return True
+        elif len(tl) >= 2 and tl[0][0] == "id" and tl[1] == ("op", "--"):
+            self._setvar(tl[0][1], self._getvar(tl[0][1]) - 1)
+            return True
+        elif len(tl) >= 3 and tl[0][0] == "id" and tl[1] == ("op", "+") and tl[2] == ("op", "+"):
+            self._setvar(tl[0][1], self._getvar(tl[0][1]) + 1)
+            return True
+        elif len(tl) >= 3 and tl[0][0] == "id" and tl[1] == ("op", "-") and tl[2] == ("op", "-"):
+            self._setvar(tl[0][1], self._getvar(tl[0][1]) - 1)
+            return True
+        elif len(tl) >= 3 and tl[0][0] == "id" and tl[1][0] == "op" and tl[1][1] in ("+=", "-=", "*=", "/=", "%="):
+            name = tl[0][1]
+            op = tl[1][1]
+            node, _ = _expr_parse(tl[2:])
+            cur = self._getvar(name)
+            v = _expr_eval(node, self._getvar, self._call, self._tick)
+            if op == "+=":
+                cur = cur + v
+            elif op == "-=":
+                cur = cur - v
+            elif op == "*=":
+                cur = cur * v
+            elif op == "/=":
+                cur = cur // v if v else cur
+            elif op == "%=":
+                cur = cur % v if v else cur
+            self._setvar(name, cur)
+            return True
+        else:
+            return False
+        node, _ = _expr_parse(tl[i:])
+        self._setvar(name, _expr_eval(node, self._getvar, self._call, self._tick))
+        return True
+
+    def _run_if(self, s):
+        m = re.match(r"^if\s*\((.*)\)\s*(.*)$", s)
+        cond_text, rest = m.group(1), m.group(2)
+        node, _ = _expr_parse(_expr_tokens(cond_text))
+        cond = _expr_eval(node, self._getvar, self._call, self._tick)
+        self._ensure_brace(rest)
+        close = self._match_brace()
+        body_start = self.pos + 1
+        if cond:
+            self.pos = body_start
+            while self.pos < close:
+                self._run_line()
+            self.pos = close + 1
+            return
+        self.pos = close + 1
+        nxt = self._peek_stripped()
+        if nxt.startswith("else"):
+            s2 = nxt[4:].strip()
+            if s2.startswith("if"):
+                self.pos += 1
+                self._run_line()
+                self.pos += 1
+                return
+            self.pos += 1
+            if "{" not in s2:
+                while self.pos < len(self.lines):
+                    nxtline = self.lines[self.pos].strip()
+                    if nxtline and "{" in nxtline:
+                        break
+                    self.pos += 1
+            close2 = self._match_brace()
+            self.pos = self.pos + 1
+            while self.pos < close2:
+                self._run_line()
+            self.pos = close2 + 1
+
+    def _run_for(self, s):
+        m = re.match(r"^for\s*\((.*)\)\s*(.*)$", s)
+        inner = m.group(1)
+        parts = _split_top(_expr_tokens(inner), ";")
+        parts = (parts + [[], [], []])[:3]
+        init, cond, upd = parts[0], parts[1], parts[2]
+        if init:
+            self._assign_toks(init)
+        cond_node, _ = _expr_parse(cond) if cond else (("num", 1), 0)
+        self._ensure_brace(m.group(2))
+        close = self._match_brace()
+        body_start = self.pos + 1
+        while _expr_eval(cond_node, self._getvar, self._call, self._tick):
+            self.pos = body_start
+            while self.pos < close:
+                self._run_line()
+            if upd:
+                self._assign_toks(upd)
+            else:
+                break
+        self.pos = close + 1
+
+    def _run_while(self, s):
+        m = re.match(r"^while\s*\((.*)\)\s*(.*)$", s)
+        cond_node, _ = _expr_parse(_expr_tokens(m.group(1)))
+        self._ensure_brace(m.group(2))
+        close = self._match_brace()
+        body_start = self.pos + 1
+        while _expr_eval(cond_node, self._getvar, self._call, self._tick):
+            self.pos = body_start
+            while self.pos < close:
+                self._run_line()
+        self.pos = close + 1
+
+
+# ============================================================================
+# LISP: a compact Scheme-style interpreter ("the holy compiler")
+# ============================================================================
+class LispError(Exception):
+    pass
+
+
+class _Sym(str):
+    __slots__ = ()
+
+    def __repr__(self):
+        return str(self)
+
+
+class LispInterpreter:
+    MAX_DEPTH = 300
+
+    def __init__(self, on_out=None, on_error=None):
+        self.out = on_out or (lambda s: None)
+        self.err = on_error or self.out
+        self.globals = {}
+        self.depth = 0
+
+    def _tick(self):
+        self.depth += 1
+        if self.depth > self.MAX_DEPTH:
+            raise LispError("recursion too deep (the golem now jokes)")
+
+    def _tokenize(self, src):
+        out, i, n = [], 0, len(src)
+        while i < n:
+            c = src[i]
+            if c.isspace():
+                i += 1
+            elif c == ";":
+                j = src.find("\n", i)
+                i = n if j < 0 else j + 1
+            elif c == '"':
+                j = i + 1
+                while j < n and src[j] != '"':
+                    j += 1
+                out.append(src[i:j + 1])
+                i = j + 1
+            elif c in "()'":
+                out.append(c)
+                i += 1
+            else:
+                j = i
+                while j < n and not src[j].isspace() and src[j] not in "();'":
+                    j += 1
+                out.append(src[i:j])
+                i = j
+        return out
+
+    def _parse_pair(self, toks):
+        if not toks:
+            raise LispError("unexpected end of input")
+        t = toks.pop(0)
+        if t == "(":
+            lst = []
+            while toks and toks[0] != ")":
+                lst.append(self._parse_pair(toks))
+            if not toks:
+                raise LispError("missing ')'")
+            toks.pop(0)
+            return lst
+        if t == ")":
+            raise LispError("unexpected ')'")
+        if t == "'":
+            return [_Sym("quote"), self._parse_pair(toks)]
+        if t.startswith('"'):
+            return t[1:-1]
+        if t == "#t":
+            return True
+        if t == "#f":
+            return False
+        if t.lstrip("-").isdigit():
+            return int(t)
+        return _Sym(t)
+
+    def _show(self, v):
+        if v is None:
+            return ""
+        if v is True:
+            return "#t"
+        if v is False:
+            return "#f"
+        if isinstance(v, list):
+            return "(" + " ".join(self._show(x) for x in v) + ")"
+        return str(v)
+
+    def _truthy(self, v):
+        return v not in (False, None)
+
+    def ev(self, expr, env):
+        self._tick()
+        if isinstance(expr, bool) or isinstance(expr, int) or expr is None:
+            return expr
+        if isinstance(expr, str) and not isinstance(expr, _Sym):
+            return expr
+        if isinstance(expr, _Sym):
+            if expr in env:
+                return env[expr]
+            raise LispError(f"unbound symbol: {expr}")
+        if not isinstance(expr, list) or not expr:
+            return expr
+        head = expr[0]
+        if isinstance(head, _Sym) and head == "quote":
+            return expr[1]
+        if isinstance(head, _Sym) and head == "if":
+            _, c, t, f = expr
+            return self.ev(t if self._truthy(self.ev(c, env)) else f, env)
+        if isinstance(head, _Sym) and head == "define":
+            target = expr[1]
+            if isinstance(target, list):
+                name = target[0]
+                params = list(target[1:])
+                body = list(expr[2:])
+                env[name] = ["closure", params, body, env]
+            else:
+                env[target] = self.ev(expr[2], env)
+            return None
+        if isinstance(head, _Sym) and head == "lambda":
+            params = list(expr[1])
+            body = list(expr[2:])
+            return ["closure", params, body, env]
+        if isinstance(head, _Sym) and head == "begin":
+            val = None
+            for sub in expr[1:]:
+                val = self.ev(sub, env)
+            return val
+        if isinstance(head, _Sym) and head == "cond":
+            for branch in expr[1:]:
+                test = branch[0]
+                if test == _Sym("else") or self._truthy(self.ev(test, env)):
+                    return self.ev(branch[1], env)
+            return None
+        if isinstance(head, _Sym) and head == "and":
+            for sub in expr[1:]:
+                if not self._truthy(self.ev(sub, env)):
+                    return False
+            return True
+        if isinstance(head, _Sym) and head == "or":
+            for sub in expr[1:]:
+                v = self.ev(sub, env)
+                if self._truthy(v):
+                    return v
+            return False
+        if isinstance(head, _Sym):
+            fn = env.get(head, head)
+        else:
+            fn = self.ev(head, env)
+        args = [self.ev(a, env) for a in expr[1:]]
+        return self._apply(fn, args, env)
+
+    def _apply(self, fn, args, env):
+        if isinstance(fn, list) and fn and fn[0] == "closure":
+            _, params, body, closure_env = fn
+            newenv = dict(closure_env)
+            for p, a in zip(params, args):
+                newenv[p] = a
+            val = None
+            for bexpr in body:
+                val = self.ev(bexpr, newenv)
+            return val
+        if not isinstance(fn, _Sym):
+            raise LispError("not a function")
+        name = str(fn)
+        if name == "+":
+            r = 0
+            for a in args:
+                r += a
+            return r
+        if name == "*":
+            r = 1
+            for a in args:
+                r *= a
+            return r
+        if name == "-":
+            r = args[0] if args else 0
+            for a in args[1:]:
+                r -= a
+            return r
+        if name == "/":
+            r = args[0] if args else 0
+            for a in args[1:]:
+                r = r // a if a else 0
+            return r
+        if name == "%":
+            return args[0] % args[1] if args[1] else 0
+        if name in ("=", "eq?"):
+            return args[0] == args[1]
+        if name == "<":
+            return args[0] < args[1]
+        if name == ">":
+            return args[0] > args[1]
+        if name == "<=":
+            return args[0] <= args[1]
+        if name == ">=":
+            return args[0] >= args[1]
+        if name == "car":
+            return args[0][0]
+        if name == "cdr":
+            return list(args[0][1:])
+        if name == "cons":
+            b = args[1]
+            return [args[0]] + (b if isinstance(b, list) else [b])
+        if name == "list":
+            return list(args)
+        if name == "append":
+            out = []
+            for a in args:
+                out.extend(a)
+            return out
+        if name == "length":
+            return len(args[0])
+        if name == "reverse":
+            return list(reversed(args[0]))
+        if name == "atom?":
+            return not isinstance(args[0], list)
+        if name == "pair?":
+            return isinstance(args[0], list)
+        if name == "null?":
+            return args[0] in ([], None)
+        if name == "not":
+            return not self._truthy(args[0])
+        if name == "print":
+            self.out(" ".join(self._show(a) for a in args))
+            return None
+        raise LispError(f"undefined function: {name}")
+
+    def run(self, src):
+        try:
+            toks = self._tokenize(src)
+            while toks:
+                expr = self._parse_pair(toks)
+                v = self.ev(expr, self.globals)
+                if v is not None:
+                    self.out(self._show(v))
+        except LispError as e:
+            self.err(f"lisp: {e}")
+
+
+# ============================================================================
+# Yiddish BASIC: numbered lines, PRINT/LET/IF/GOTO/FOR (one pastel yeshiva at a time)
+# ============================================================================
+class BasicError(Exception):
+    pass
+
+
+class BasicInterpreter:
+    MAX_STEPS = 20000
+
+    def __init__(self, on_out=None, on_error=None):
+        self.out = on_out or (lambda s: None)
+        self.err = on_error or self.out
+        self.vars = {}
+        self.lines = []
+        self.pos = 0
+        self.stack = []
+        self.loops = []
+        self.data = []
+        self.ri = 0
+        self.steps = 0
+
+    def _tick(self):
+        self.steps += 1
+        if self.steps > self.MAX_STEPS:
+            raise BasicError("too many steps (the loop is a dybbuk)")
+
+    def _getvar(self, name):
+        return self.vars.get(name)
+
+    def _truthy(self, v):
+        return v != 0
+
+    def _expr_text(self, text):
+        node, _ = _expr_parse(_expr_tokens(text))
+        return _expr_eval(node, self._getvar, None, self._tick)
+
+    def run_source(self, content):
+        self._parse(content)
+        try:
+            n = len(self.lines)
+            while 0 <= self.pos < n:
+                self._tick()
+                num, text = self.lines[self.pos]
+                jump = self._run_stmt(text)
+                self.pos = jump if jump is not None else self.pos + 1
+        except _ReturnSignal:
+            pass
+        except BasicError as e:
+            self.err(f"basic: {e}")
+
+    def _parse(self, content):
+        out = []
+        data = []
+        for raw in content.splitlines():
+            s = raw.strip()
+            if not s:
+                continue
+            up = s.upper()
+            if up.startswith("DATA "):
+                for item in s[5:].split(","):
+                    item = item.strip()
+                    if item == "":
+                        continue
+                    if item.lstrip("-").isdigit():
+                        data.append(int(item))
+                    else:
+                        data.append(item)
+                continue
+            m = re.match(r"^(\d+)\s+DATA\s+(.*)$", s, re.IGNORECASE)
+            if m:
+                num = int(m.group(1))
+                for item in m.group(2).split(","):
+                    item = item.strip()
+                    if item == "":
+                        continue
+                    if item.lstrip("-").isdigit():
+                        data.append(int(item))
+                    else:
+                        data.append(item)
+                out.append((num, ""))
+                continue
+            m = re.match(r"^(\d+)\s+(.*)$", s)
+            if m:
+                out.append((int(m.group(1)), m.group(2)))
+            else:
+                out.append((None, s))
+        out.sort(key=lambda t: t[0] if t[0] is not None else 0)
+        self.lines = out
+        self.data = data
+
+    def _find_line(self, num):
+        for i, (lnum, _) in enumerate(self.lines):
+            if lnum == num:
+                return i
+        raise BasicError(f"no line {num}")
+
+    def _run_stmt(self, s):
+        up = s.upper().strip()
+        if not up or up.startswith("REM") or up.startswith("'"):
+            return None
+        if up.startswith("PRINT") or up.startswith("?"):
+            text = s[5:].lstrip() if up.startswith("PRINT") else s[1:].lstrip()
+            parts = self._split_print(text)
+            self.out("".join(self._print_part(p) for p in parts))
+            return None
+        if up.startswith("LET "):
+            m = re.match(r"^LET\s+(\w+)\s*=\s*(.+)$", s)
+            if m:
+                self.vars[m.group(1)] = self._expr_text(m.group(2))
+            return None
+        m = re.match(r"^(\w+)\s*=\s*(.+)$", s)
+        if m:
+            self.vars[m.group(1)] = self._expr_text(m.group(2))
+            return None
+        if up.find(" THEN ") > 0:
+            j = up.find(" THEN ")
+            cond_text = s[3:j].strip()
+            then_text = s[j + 6:].strip()
+            if self._truthy(self._expr_text(cond_text)):
+                if then_text.lstrip("-").isdigit():
+                    return self._find_line(int(then_text))
+                if then_text.upper().startswith("GOTO"):
+                    g = re.match(r"^GOTO\s+(\d+)$", then_text.upper())
+                    return self._find_line(int(g.group(1)))
+                if then_text.upper().startswith("PRINT") or then_text.upper().startswith("?"):
+                    st = then_text[5:].lstrip() if then_text.upper().startswith("PRINT") else then_text[1:].lstrip()
+                    self.out("".join(self._print_part(p) for p in self._split_print(st)))
+                    return None
+                m2 = re.match(r"^(\w+)\s*=\s*(.+)$", then_text)
+                if m2:
+                    self.vars[m2.group(1)] = self._expr_text(m2.group(2))
+                    return None
+            return None
+        if up.startswith("FOR "):
+            m = re.match(r"^FOR\s+(\w+)\s*=\s*(.+?)\s+TO\s+(.+?)\s*(?:STEP\s+(.+))?$", up)
+            var, start, limit = m.group(1), m.group(2), m.group(3)
+            step = m.group(4) if m.group(4) else "1"
+            self.vars[var] = self._expr_text(start)
+            self.loops.append({
+                "var": var,
+                "limit": self._expr_text(limit),
+                "step": self._expr_text(step),
+                "for_idx": self.pos,
+            })
+            return None
+        if up.startswith("NEXT "):
+            var = up[5:].strip()
+            while self.loops and self.loops[-1]["var"] != var:
+                self.loops.pop()
+            if not self.loops:
+                raise BasicError("NEXT without FOR")
+            loop = self.loops[-1]
+            self.vars[var] = self.vars.get(var, 0) + loop["step"]
+            if (loop["step"] > 0 and self.vars[var] <= loop["limit"]) or (
+                    loop["step"] < 0 and self.vars[var] >= loop["limit"]):
+                return loop["for_idx"] + 1
+            self.loops.pop()
+            return None
+        if up.startswith("GOTO "):
+            g = re.match(r"^GOTO\s+(\d+)$", up)
+            return self._find_line(int(g.group(1)))
+        if up.startswith("GOSUB "):
+            g = re.match(r"^GOSUB\s+(\d+)$", up)
+            self.stack.append(self.pos + 1)
+            return self._find_line(int(g.group(1)))
+        if up.startswith("RETURN"):
+            if not self.stack:
+                raise BasicError("RETURN without GOSUB")
+            return self.stack.pop()
+        if up.startswith("END") or up.startswith("STOP"):
+            raise _ReturnSignal()
+        if up.startswith("READ "):
+            for nm in s[5:].split(","):
+                nm = nm.strip()
+                if not nm:
+                    continue
+                if self.ri >= len(self.data):
+                    raise BasicError("DATA is empty as a zinuk")
+                self.vars[nm] = self.data[self.ri]
+                self.ri += 1
+            return None
+        if up.startswith("INPUT"):
+            body = s[5:].strip()
+            prompt = body
+            m = re.match(r'^"([^"]*)"\s*;\s*(\w+)$', body)
+            if m:
+                prompt, nm = m.group(1), m.group(2)
+            else:
+                nm = body.rstrip(";").strip()
+            self.vars[nm] = self._input_value(prompt or (nm + "? "))
+            return None
+        raise BasicError(f"can't parse line: {s}")
+
+    def _input_value(self, prompt):
+        try:
+            root = tk._default_root
+            if root is None:
+                return 0
+            ans = simpledialog.askstring("Yiddish BASIC input", prompt, parent=root)
+            if ans is None:
+                return 0
+            ans = ans.strip()
+            if ans.lstrip("-").isdigit():
+                return int(ans)
+            return ans
+        except Exception:
+            return 0
+
+    def _split_print(self, text):
+        parts = []
+        cur = ""
+        mode = False
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if mode:
+                cur += ch
+                if ch == '"':
+                    mode = False
+            elif ch == '"':
+                cur += ch
+                mode = True
+            elif ch in ";,":
+                parts.append(cur)
+                parts.append(("sep", ch))
+                cur = ""
+            else:
+                cur += ch
+            i += 1
+        parts.append(cur)
+        return parts
+
+    def _print_part(self, p):
+        if isinstance(p, tuple):
+            return "\t" if p[1] == "," else ""
+        p = p.strip()
+        if not p:
+            return ""
+        if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+            return p[1:-1]
+        try:
+            return str(self._expr_text(p))
+        except (BasicError, HolyCError):
+            return p
+
+
+# ============================================================================
+# Siddur: the package manager (mima'amakim it installs)
+# ============================================================================
+_DEMO_PACKAGES = {
+    "latkes": {
+        "version": "1.2",
+        "author": "bubbe@YUshiveOS",
+        "category": "food",
+        "desc": "A proper latke countdown, with oil.",
+        "entry": "latkes.HC",
+        "cmd": "latkes",
+        "files": {
+            "latkes.HC": (
+                "I64 n = 3;\n"
+                "U0 Countdown( I64 k ) {\n"
+                "  while ( k > 0 ) {\n"
+                "    Print( \"- \", k, \" more before the oil...\\n\" );\n"
+                "    k = k - 1;\n"
+                "  }\n"
+                "}\n"
+                "Print( \"Take 3 potatoes. Shoyn.\\n\" );\n"
+                "Countdown( n );\n"
+                "Println( \"Golden and blessed.\" );\n"
+            ),
+        },
+    },
+    "daf-yomi": {
+        "version": "0.9",
+        "author": "mashekh@YUshiveOS",
+        "category": "texts",
+        "desc": "A [fake] daf of the day, imaginary but earnest.",
+        "entry": "daf.HC",
+        "cmd": "daf-yomi",
+        "files": {
+            "daf.HC": (
+                "I64 day = 1;\n"
+                "for ( day = 1; day <= 3; day++ ) {\n"
+                "  Print( \"Daf \", day, \": a fine tractate of the imagination.\\n\" );\n"
+                "}\n"
+                "Println( \"(Not actual Torah - the real kind you should learn elsewhere.)\" );\n"
+            ),
+        },
+    },
+    "zmanim": {
+        "version": "2.1",
+        "author": "shoimer@YUshiveOS",
+        "category": "texts",
+        "desc": "Assumed zmanim for a perfectly sunny pretend day.",
+        "entry": "zmanim.BAS",
+        "cmd": "zmanim",
+        "files": {
+            "zmanim.BAS": (
+                "REM Assumed zmanim for a sunny pretend day\n"
+                "LET X = 5\n"
+                "FOR I = 1 TO X\n"
+                " PRINT \"Sunrise is very early. \", I\n"
+                "NEXT I\n"
+                "PRINT \"Derech: done for today.\"\n"
+            ),
+        },
+    },
+    "mishnayos": {
+        "version": "1.0",
+        "author": "tanna@YUshiveOS",
+        "category": "texts",
+        "desc": "Sample a few mishnayot (the flatbread of the mind).",
+        "entry": "mishnayos.BAS",
+        "cmd": "mishnayos",
+        "files": {
+            "mishnayos.BAS": (
+                "10 DATA 6,7,5,9\n"
+                "20 READ A,B,C,D\n"
+                "30 PRINT \"Mishnayot sampled: \", A+B+C+D\n"
+                "40 IF A + B > 10 THEN GOTO 60\n"
+                "50 PRINT \"An easy masechet today.\"\n"
+                "55 END\n"
+                "60 PRINT \"A brisk review day.\"\n"
+            ),
+        },
+    },
+    "tanakh-quiz": {
+        "version": "1.4",
+        "author": "navi@YUshiveOS",
+        "category": "games",
+        "desc": "A tiny LISP quiz about the fruit basket of the desert.",
+        "entry": "quiz.LSP",
+        "cmd": "tanakh-quiz",
+        "files": {
+            "quiz.LSP": (
+                "(define fruits '(fig pomegranate olive date))\n"
+                "(define (len lst) (if (null? lst) 0 (+ 1 (len (cdr lst)))))\n"
+                "(print \"The fruit basket holds \" (len fruits) \" kinds.\")\n"
+                "(print \"First in the desert: \" (car fruits))\n"
+                "(if (> (len fruits) 2) (print \"Enough for the table.\") (print \"Grow more.\"))\n"
+            ),
+        },
+    },
+    "schtick": {
+        "version": "0.3",
+        "author": "badchen@YUshiveOS",
+        "category": "vibes",
+        "desc": "A punchline, recursively chosen. Laugh or it is a mitzvah.",
+        "entry": "schtick.LSP",
+        "cmd": "schtick",
+        "files": {
+            "schtick.LSP": (
+                "(define (choose lst) (if (null? (cdr lst)) (car lst) (choose (cdr lst))))\n"
+                "(print (choose '(nu-so-a-segulah-is-how-you-look-at-it)))\n"
+            ),
+        },
+    },
+}
+
+
+class Siddur:
+    @staticmethod
+    def _mkdirs(path):
+        parts = path.strip("/").split("/")
+        cur = ""
+        for part in parts:
+            cur += "/" + part
+            if VFS.resolve(cur) is None:
+                VFS.mkdir(cur)
+
+    @staticmethod
+    def installed():
+        node = VFS.resolve(PKG_ROOT)
+        if node is None or node.type != "dir":
+            return []
+        out = []
+        for name, child in sorted(node.children.items()):
+            if child.type != "dir":
+                continue
+            meta = {}
+            m = VFS.resolve(PKG_ROOT + "/" + name + "/manifest.json")
+            if m is not None:
+                try:
+                    meta = json.loads(m.content)
+                except Exception:
+                    meta = {}
+            out.append((name, meta))
+        return out
+
+    @staticmethod
+    def install(term, name):
+        pkg = _DEMO_PACKAGES.get(name)
+        if pkg is None:
+            return "ENOENT"
+        if VFS.resolve(f"{PKG_ROOT}/{name}") is not None:
+            return "EEXIST"
+        Siddur._mkdirs(PKG_ROOT)
+        VFS.mkdir(f"{PKG_ROOT}/{name}")
+        manifest = {
+            "name": name,
+            "version": pkg["version"],
+            "author": pkg["author"],
+            "category": pkg["category"],
+            "desc": pkg["desc"],
+            "entry": pkg["entry"],
+            "cmd": pkg.get("cmd"),
+        }
+        VFS.write(f"{PKG_ROOT}/{name}/manifest.json", json.dumps(manifest, indent=2))
+        for rel, content in pkg["files"].items():
+            VFS.write(f"{PKG_ROOT}/{name}/{rel}", content)
+        return None
+
+    @staticmethod
+    def remove(term, name):
+        node = VFS.resolve(f"{PKG_ROOT}/{name}")
+        if node is None or node.type != "dir":
+            return "ENOENT"
+        rc = VFS.trash(f"{PKG_ROOT}/{name}")
+        return rc
+
+    @staticmethod
+    def package_manifest(name):
+        for child_name, meta in Siddur.installed():
+            if child_name == name:
+                return meta
+        return None
+
+    @staticmethod
+    def command_path(name):
+        for pkg_name, meta in Siddur.installed():
+            cmd = meta.get("cmd") or meta.get("name")
+            if cmd == name and meta.get("entry"):
+                return f"{PKG_ROOT}/{pkg_name}/{meta['entry']}"
+        return None
+
+    @staticmethod
+    def collect_dir(node, prefix=""):
+        files = {}
+        for name, child in sorted(node.children.items()):
+            rel = (prefix + "/" + name) if prefix else name
+            if child.type == "dir":
+                files.update(Siddur.collect_dir(child, rel))
+            else:
+                files[rel] = child.content
+        return files
+
+    @staticmethod
+    def publish(term, dir_path):
+        node = VFS.resolve(dir_path, term.cwd)
+        if node is None or node.type != "dir":
+            return "ENOENT"
+        files = Siddur.collect_dir(node)
+        files.pop("manifest.json", None)
+        if not files:
+            return "EMPTY"
+        base = node.name
+        entry = next((f for f in files if f.lower().endswith((".hc", ".lsp", ".bas"))), sorted(files)[0])
+        meta = {
+            "name": base,
+            "version": "1.0",
+            "author": f"{VENV.user}@{VENV.hostname}",
+            "category": "misc",
+            "desc": "A package freshly simmered.",
+            "entry": entry,
+            "cmd": base,
+        }
+        payload = {
+            "format": "yushive-pkg",
+            "files": {rel: base64.b64encode(content.encode("utf-8")).decode("ascii") for rel, content in files.items()},
+        }
+        payload.update({k: v for k, v in meta.items()})
+        blob = json.dumps(payload, indent=2)
+        vfs_path = "/Home/" + base + ".pkg"
+        VFS.write(vfs_path, blob)
+        try:
+            PKG_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+            real = PKG_EXPORT_DIR / (base + ".pkg")
+            real.write_text(blob)
+        except OSError:
+            real = None
+        return (vfs_path, real)
+
+    @staticmethod
+    def import_pkg(term, file_path):
+        node = VFS.resolve(file_path, term.cwd)
+        if node is None or node.type != "file":
+            return "ENOENT"
+        try:
+            payload = json.loads(node.content)
+        except Exception:
+            return "EBAD"
+        if payload.get("format") != "yushive-pkg":
+            return "EBAD"
+        name = payload.get("name")
+        if not name:
+            return "EBAD"
+        if VFS.resolve(f"{PKG_ROOT}/{name}") is not None:
+            return "EEXIST"
+        Siddur._mkdirs(PKG_ROOT)
+        VFS.mkdir(f"{PKG_ROOT}/{name}")
+        meta = {k: payload.get(k) for k in ("name", "version", "author", "category", "desc", "entry", "cmd")}
+        VFS.write(f"{PKG_ROOT}/{name}/manifest.json", json.dumps(meta, indent=2))
+        for rel, b64 in payload.get("files", {}).items():
+            content = base64.b64decode(b64).decode("utf-8")
+            VFS.write(f"{PKG_ROOT}/{name}/{rel}", content)
+        return None
+
+    @staticmethod
+    def search(term, query=None):
+        rows = []
+        q = (query or "").lower()
+        for name, pkg in sorted(_DEMO_PACKAGES.items()):
+            hay = " ".join([name, pkg["category"], pkg["desc"], pkg["author"]])
+            if q and q not in hay.lower():
+                continue
+            rows.append((name, pkg["version"], pkg["category"], pkg["desc"]))
+        return rows
 
 
 # ============================================================================
@@ -1312,10 +3505,22 @@ class FileBrowser(tk.Frame):
         self.context_menu = tk.Menu(self, tearoff=0, bg=BG_BLUE, fg=ORANGE, activebackground=SELECT, activeforeground=ORANGE_BRIGHT, font=FONT_UI)
         self.context_menu.add_command(label="Open", command=self._context_open)
         self.context_menu.add_command(label="Open in Terminal", command=self._context_open_terminal)
+        self.context_menu.add_command(label="Edit", command=self._context_edit)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Copy Path", command=self._context_copy_path)
         self.context_menu.add_command(label="Refresh", command=self._refresh)
         self.context_menu.add_command(label="New Directory", command=self._context_new_dir)
+
+    def _context_edit(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        name = self.tree.item(sel[0], "text")
+        node = VFS.resolve(name, self.current_path)
+        if node is not None and node.type == "file":
+            parent_win = self._get_gui_parent()
+            if parent_win:
+                parent_win.open_editor(VFS._path_of(node))
 
     def _on_right_click(self, event):
         item = self.tree.identify_row(event.y)
@@ -1377,11 +3582,19 @@ class FileBrowser(tk.Frame):
         self.path_var.set(self.current_path)
         self.tree.delete(*self.tree.get_children())
 
+        self.tree.tag_configure("fb_dir", foreground=ORANGE_BRIGHT, font=FONT_UI_BOLD)
+        self.tree.tag_configure("fb_file", foreground=ORANGE)
+        self.tree.tag_configure("fb_meta", foreground=ORANGE_DIM)
+        self.tree.tag_configure("fb_hidden", foreground=ORANGE_DIM)
+
         for child in sorted(node.children.values(), key=lambda c: (c.type != "dir", c.name.lower())):
             size = "--" if child.type == "dir" else FileBrowser._format_size(child.size)
             mtime = child.mtime.strftime("%Y-%m-%d %H:%M")
             name = child.name + "/" if child.type == "dir" else child.name
-            self.tree.insert("", tk.END, text=name, values=(size, mtime, child.perms))
+            tags = ["fb_dir"] if child.type == "dir" else ["fb_file"]
+            if child.name.startswith("."):
+                tags.append("fb_hidden")
+            self.tree.insert("", tk.END, text=name, values=(size, mtime, child.perms), tags=tags)
 
         if self.on_path_change:
             self.on_path_change(self.current_path)
@@ -1394,8 +3607,14 @@ class FileBrowser(tk.Frame):
     def _open_item(self, item):
         name = self.tree.item(item, "text")
         node = VFS.resolve(name, self.current_path)
-        if node is not None and node.type == "dir":
+        if node is None:
+            return
+        if node.type == "dir":
             self._navigate_to(VFS._path_of(node))
+        else:
+            parent_win = self._get_gui_parent()
+            if parent_win:
+                parent_win.open_editor(VFS._path_of(node))
 
     def _go_back(self):
         node = VFS.resolve(self.current_path)
@@ -1432,6 +3651,257 @@ class FileBrowser(tk.Frame):
 
 
 # ============================================================================
+# YumePad: the text editor of the yeshiva
+# ============================================================================
+class YumePad(tk.Frame):
+    def __init__(self, parent, path, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.pack(fill=tk.BOTH, expand=True)
+        self.path = path
+        self._status = "saved"
+
+        bar = tk.Frame(self, bg=BG_BLUE_ALT)
+        bar.pack(fill=tk.X)
+        self.title_var = tk.StringVar(value=f"  YumePad - {path}")
+        tk.Label(bar, textvariable=self.title_var, bg=BG_BLUE_ALT, fg=ORANGE_BRIGHT,
+                 font=FONT_UI_BOLD).pack(side=tk.LEFT)
+        ttk.Button(bar, text=" Close ", command=self.close).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(bar, text=" Save ", command=self.save).pack(side=tk.RIGHT, padx=3)
+
+        self.editor = tk.Text(
+            self, bg=BG_BLUE, fg=ORANGE, insertbackground=ORANGE_BRIGHT,
+            selectbackground=SELECT, font=FONT_MONO, relief=tk.FLAT,
+            padx=10, pady=10, undo=True, insertwidth=2, wrap="word",
+        )
+        self.editor.pack(fill=tk.BOTH, expand=True)
+
+        node = VFS.resolve(self.path)
+        if node is not None:
+            self.editor.insert("1.0", node.content)
+        self.editor.focus_set()
+
+        self.status_var = tk.StringVar(value="  file is kosher (saved)")
+        tk.Label(self, textvariable=self.status_var, bg=BG_BLUE_DEEP, fg=ORANGE_DIM,
+                 font=FONT_MONO_SM, anchor="w").pack(fill=tk.X)
+
+        self.editor.bind("<Control-s>", lambda e: (self.save(), "break")[1])
+        self.editor.bind("<Any-KeyPress>", self._mark_dirty)
+
+    def _mark_dirty(self, event):
+        if self._status != "dirty":
+            self._status = "dirty"
+            self.title_var.set(f"  YumePad - {self.path} (dirty)")
+            self.status_var.set("  unsaved changes - press Ctrl+S or Save")
+
+    def save(self):
+        node = VFS.resolve(self.path)
+        text = self.editor.get("1.0", "end-1c")
+        if node is not None and node.locked:
+            beep()
+            self.status_var.set("  permission dinied: the file is locked by chmod 000")
+            return
+        if node is None:
+            VFS.mkfile(self.path, content=text)
+        else:
+            VFS.set_content(node, text)
+        self._status = "saved"
+        self.status_var.set("  file is kosher (saved)")
+        self.title_var.set(f"  YumePad - {self.path}")
+
+    def close(self):
+        if self._status == "dirty":
+            beep()
+            self.status_var.set("  unsaved changes! Save first, or accept the crumbs.")
+            return
+        gui = self._get_gui_parent()
+        if gui:
+            gui.close_tab_for(self)
+
+    def _get_gui_parent(self):
+        p = self.master
+        while p is not None:
+            if isinstance(p, YumeGUI):
+                return p
+            p = p.master
+        return None
+
+
+# ============================================================================
+# Star Field screen saver (a nod to a certain holy OS)
+# ============================================================================
+class Screensaver(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.master_win = master
+        self.overrideredirect(True)
+        self.configure(bg=BG_BLUE_DEEP)
+        self.attributes("-topmost", True)
+        w = master.winfo_width() or 1024
+        h = master.winfo_height() or 680
+        x = master.winfo_x()
+        y = master.winfo_y()
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        self.canvas = tk.Canvas(self, bg=BG_BLUE_DEEP, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        sw = master.winfo_screenwidth()
+        sh = master.winfo_screenheight()
+        self.stars = [
+            {
+                "x": random.uniform(0, sw), "y": random.uniform(0, sh),
+                "vx": random.uniform(-0.5, -0.05),
+                "vy": random.uniform(-0.25, -0.02),
+                "size": random.choice((1, 1, 2, 3)),
+            }
+            for _ in range(130)
+        ]
+        self.frame = 0
+        self._dismissed = False
+        self.canvas.bind("<Any-KeyPress>", self._dismiss)
+        self.canvas.bind("<Any-Button>", self._dismiss)
+        self.canvas.bind("<Motion>", self._dismiss)
+        self.after(40, self._animate)
+
+    def _dismiss(self, event=None):
+        if self._dismissed:
+            return
+        self._dismissed = True
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        if self.master_win is not None:
+            self.master_win._screensaver_active = False
+            self.master_win._arm_idle()
+
+    def _animate(self):
+        if self._dismissed:
+            return
+        self.canvas.delete("all")
+        w = self.canvas.winfo_width() or 1024
+        h = self.canvas.winfo_height() or 680
+        for s in self.stars:
+            s["x"] += s["vx"]
+            s["y"] += s["vy"]
+            if s["x"] < 0:
+                s["x"] = w
+            if s["y"] < 0:
+                s["y"] = h
+            color = FG_CREAM if s["size"] >= 3 else FG_GOLD
+            self.canvas.create_rectangle(s["x"], s["y"], s["x"] + s["size"], s["y"] + s["size"],
+                                         fill=color, outline="")
+        cx, cy = w // 2, h // 2
+        r = min(w, h) // 5
+        offset = self.frame * 0.03
+
+        def ring_pts(start_angle):
+            pts = []
+            for i in range(3):
+                a = -math.pi / 2 + start_angle + i * 2 * math.pi / 3 + offset
+                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+            return pts
+
+        def flat(pts):
+            return [c for p in pts for c in p]
+
+        up = ring_pts(0)
+        dn = ring_pts(math.pi / 3)
+        self.canvas.create_line(flat(up + [up[0]]), fill=FG_GOLD, width=4)
+        self.canvas.create_line(flat(dn + [dn[0]]), fill=FG_CREAM, width=4)
+        self.canvas.create_text(cx, h - 30, text="YUshiveOS is resting now.",
+                                fill=FG_STONE, font=("DejaVu Sans Mono", 11))
+
+        self.frame += 1
+        self.after(40, self._animate)
+
+
+# ============================================================================
+# Power sequence (reboot / shutdown screens)
+# ============================================================================
+class PowerSequence(tk.Toplevel):
+    def __init__(self, master, mode="reboot"):
+        super().__init__(master)
+        self.master_win = master
+        self.mode = mode
+        self.overrideredirect(True)
+        self.configure(bg=BG_BLUE)
+        self.attributes("-topmost", True)
+        w = master.winfo_width() or 1024
+        h = master.winfo_height() or 680
+        self.geometry(f"{w}x{h}+{master.winfo_x()}+{master.winfo_y()}")
+
+        frame = tk.Frame(self, bg=BG_BLUE)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        if mode == "reboot":
+            title = "YUshiveOS is rebooting"
+            lines = [
+                "Consulting the Rebbe one last time...",
+                "Gathering the shmita of the disk...",
+                "The Rebbe says: be back in a moment.",
+            ]
+        else:
+            title = "YUshiveOS is shutting down"
+            lines = [
+                "It is now safe to daven.",
+                "The cholent has been covered with a clean foil.",
+                "Sessions are sed, files are kosher and saved.",
+            ]
+        tk.Label(frame, text=title, bg=BG_BLUE, fg=ORANGE_BRIGHT,
+                 font=("DejaVu Sans Mono", 18, "bold")).pack(pady=48)
+        for ln in lines:
+            tk.Label(frame, text=ln, bg=BG_BLUE, fg=ORANGE,
+                     font=("DejaVu Sans Mono", 11)).pack(pady=3)
+        self.step = 0
+        self.after(1800, self._finish)
+
+    def _finish(self):
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        if self.mode == "reboot":
+            self.master_win.after(150, self.master_win._start_boot)
+        else:
+            self.master_win._close_os()
+
+
+# ============================================================================
+# Kernel panic (fake blue screen of death)
+# ============================================================================
+class PanicScreen(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.master_win = master
+        self.overrideredirect(True)
+        self.configure(bg="#0a0a00")
+        self.attributes("-topmost", True)
+        w = master.winfo_width() or 1024
+        h = master.winfo_height() or 680
+        self.geometry(f"{w}x{h}+{master.winfo_x()}+{master.winfo_y()}")
+        tk.Label(
+            self,
+            text=(
+                "KERNEL PANIC - ZYGOAT\n\n"
+                "The Rebbe has panicked, which is a good thing.\n"
+                "A fatal exception has occurred at 74:074AH in NUCHAS.\n"
+                "The second temple has been rebuilt 0 times. Halt.\n\n"
+                "This virtual machine will reboot after a short nap."
+            ),
+            bg="#0a0a00", fg="orange", font=("DejaVu Sans Mono", 13),
+            justify="left",
+        ).pack(pady=60, padx=40)
+        self.after(3500, self._reboot)
+
+    def _reboot(self):
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        self.master_win.trigger_reboot()
+
+
+# ============================================================================
 # Main GUI
 # ============================================================================
 class YumeGUI(tk.Tk):
@@ -1447,8 +3917,14 @@ class YumeGUI(tk.Tk):
 
         self.active_processes = {}
         self.tab_buttons = {}
+        self.tab_titles = {}
         self.cwd = "/Home"
         self.revealed = False
+
+        _load_conf()
+
+        self._screensaver_active = False
+        self._idle_after = None
 
         self._build_layout()
 
@@ -1456,6 +3932,10 @@ class YumeGUI(tk.Tk):
         self.after(300, self._start_boot)
 
         self._start_status_clock()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        for seq in ("<Key>", "<Button-1>", "<Button-3>", "<Motion>"):
+            self.bind_all(seq, self._on_user_activity, add="+")
 
     # ---- theme ---------------------------------------------------------------
     def _apply_theme(self):
@@ -1544,9 +4024,21 @@ class YumeGUI(tk.Tk):
         btn_info = ttk.Button(inner_bar, text="System Info", command=self.open_system_info)
         btn_info.pack(side=tk.LEFT, padx=4)
 
+        self.power_menu = tk.Menu(self, tearoff=0, bg=BG_BLUE, fg=ORANGE, activebackground=SELECT, activeforeground=ORANGE_BRIGHT, font=FONT_UI)
+        self.power_menu.add_command(label="Shutdown", command=self.trigger_shutdown)
+        self.power_menu.add_command(label="Reboot", command=self.trigger_reboot)
+        self.power_menu.add_separator()
+        self.power_menu.add_command(label="First Boot (wipe disk)", command=self.first_boot)
+        btn_power = ttk.Menubutton(inner_bar, text="Power", menu=self.power_menu)
+        btn_power.pack(side=tk.RIGHT, padx=4)
+
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True)
         self.notebook.bind("<Button-2>", self._on_middle_click_tab)
+
+        self.taskbar = ttk.Frame(self, style="Status.TFrame")
+        self.taskbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.taskbar_buttons = {}
 
         self.status_bar = ttk.Frame(self, style="Status.TFrame")
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1617,6 +4109,23 @@ class YumeGUI(tk.Tk):
         ttk.Button(btn_row, text=" File Manager ", command=self.open_file_manager).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_row, text=" System Info ", command=self.open_system_info).pack(side=tk.LEFT, padx=4)
 
+        icon_row = tk.Frame(body, bg=BG_BLUE)
+        icon_row.pack(anchor="w", padx=24, pady=(14, 2))
+        for label, icon, cmd in [
+            ("Terminal", ">_", self.open_terminal),
+            ("Files", "[]", self.open_file_manager),
+            ("YumePad", "~", lambda: self.open_editor("/Home/Welcome.txt")),
+            ("Info", "i", self.open_system_info),
+            ("Star Field", "*", lambda: self.start_screensaver(force=True)),
+        ]:
+            cell = tk.Frame(icon_row, bg=BG_BLUE)
+            cell.pack(side=tk.LEFT, padx=12)
+            tk.Label(cell, text=icon, bg=BG_BLUE_ALT, fg=ORANGE_BRIGHT, font=("DejaVu Sans Mono", 18, "bold"),
+                     width=5, height=2, cursor="hand2").pack()
+            tk.Label(cell, text=label, bg=BG_BLUE, fg=ORANGE, font=FONT_UI).pack()
+            for w in cell.winfo_children()[:1]:
+                w.bind("<Button-1>", lambda e, fn=cmd: fn())
+
         tk.Label(
             body, text=random.choice(BOOT_FACTS), bg=BG_BLUE, fg=ORANGE_DIM,
             font=("DejaVu Sans Mono", 9), wraplength=700, justify="left",
@@ -1628,19 +4137,94 @@ class YumeGUI(tk.Tk):
 
     def reveal_dashboard(self):
         self.revealed = True
+        beep()
         try:
             self.notebook.select(self.dashboard_holder)
         except tk.TclError:
             pass
+        self._arm_idle()
 
     def trigger_reboot(self):
-        # close all tabs, replay boot
+        # close all tabs, run the power sequence, then replay boot
+        self._save_all()
         for tab in list(self.tab_buttons.keys()):
             try:
                 self.close_tab(tab)
             except Exception:
                 pass
-        self.after(200, self._start_boot)
+        self.after(100, lambda: PowerSequence(self, mode="reboot"))
+
+    def trigger_shutdown(self):
+        self.after(100, lambda: PowerSequence(self, mode="shutdown"))
+
+    def first_boot(self):
+        VFS.destroy_disk()
+        try:
+            CONF_IMAGE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._save_all()
+        self.trigger_reboot()
+
+    def _save_all(self):
+        VFS.save()
+        _save_conf()
+
+    def _on_close(self):
+        self._save_all()
+        self.destroy()
+
+    def _close_os(self):
+        self._save_all()
+        VFS.empty_recycle_bin()
+        self.destroy()
+
+    def show_panic(self):
+        self._save_all()
+        self.after(500, lambda: PanicScreen(self))
+
+    def open_editor(self, path):
+        node = VFS.resolve(path)
+        if node is None or node.type != "file":
+            return
+        content = self.add_app_tab("YumePad")
+        YumePad(content, VFS._path_of(node))
+
+    def start_screensaver(self, force=False):
+        if self._screensaver_active:
+            return
+        if not self.revealed and not force:
+            return
+        self._screensaver_active = True
+        Screensaver(self)
+
+    def _arm_idle(self):
+        if self._idle_after is not None:
+            try:
+                self.after_cancel(self._idle_after)
+            except Exception:
+                pass
+        self._idle_after = self.after(60000, self._on_idle_timeout)
+
+    def _on_idle_timeout(self):
+        self._idle_after = None
+        self.start_screensaver(force=True)
+
+    def _on_user_activity(self, event=None):
+        self._arm_idle()
+
+    def _update_taskbar(self):
+        for w in self.taskbar.winfo_children():
+            w.destroy()
+        self.taskbar_buttons = {}
+        for tab_frame, title in self.tab_titles.items():
+            if title.strip() in ("Dashboard",):
+                continue
+            btn = tk.Label(self.taskbar, text=" " + title + " ", bg=BG_BLUE_ALT, fg=ORANGE,
+                           font=FONT_UI_BOLD, padx=6, pady=2, cursor="hand2")
+            btn.pack(side=tk.LEFT, padx=2, pady=2)
+            btn.bind("<Button-1>", lambda e, f=tab_frame: self.notebook.select(f))
+            self.taskbar_buttons[tab_frame] = btn
 
     # ---- tabs --------------------------------------------------------------
     def add_app_tab(self, app_title, process=None):
@@ -1673,8 +4257,11 @@ class YumeGUI(tk.Tk):
         if process:
             self.active_processes[tab_frame] = process
 
+        self.tab_titles[tab_frame] = app_title
+
         self.notebook.add(tab_frame, text="")
         self.notebook.select(tab_frame)
+        self._update_taskbar()
         return tab_content
 
     def close_tab(self, tab_frame):
@@ -1690,6 +4277,7 @@ class YumeGUI(tk.Tk):
         btns = self.tab_buttons.pop(tab_frame, None)
         if btns:
             btns[0].destroy()
+        self.tab_titles.pop(tab_frame, None)
 
         for child in tab_frame.winfo_children():
             child.destroy()
@@ -1698,6 +4286,7 @@ class YumeGUI(tk.Tk):
             self.notebook.forget(tab_frame)
         except tk.TclError:
             pass
+        self._update_taskbar()
         tab_frame.destroy()
 
     def close_tab_for(self, terminal_widget):
@@ -1753,6 +4342,25 @@ class YumeGUI(tk.Tk):
         tk.Label(content, text="YUshiveOS System Information", bg=BG_BLUE, fg=ORANGE_BRIGHT,
                  font=("DejaVu Sans Mono", 14, "bold")).pack(anchor="w", pady=(0, 15))
 
+        tk.Label(content, text="BIOS / BOARD", bg=BG_BLUE, fg=ORANGE_DIM,
+                 font=("DejaVu Sans Mono", 10, "bold")).pack(anchor="w", pady=(0, 3))
+        hardware = [
+            ("BIOS", "YUshiveBIOS v1.06 (7 Tevet 5770)"),
+            ("Board", "Mitzvah 613-5770 (a blessed year)"),
+            ("Boot Device", "CholentHD (Primary & Only)"),
+            ("Time Zone", "Yerushalayim Standard Time"),
+            ("Disk Image", str(DISK_IMAGE)),
+            ("AC Power", "74-MHz (unclamped)"),
+        ]
+        for label, value in hardware:
+            row = tk.Frame(content, bg=BG_BLUE)
+            row.pack(anchor="w", pady=2, fill=tk.X)
+            tk.Label(row, text=f"{label}:", bg=BG_BLUE, fg=ORANGE_DIM, font=FONT_UI_BOLD,
+                     width=14, anchor="w").pack(side=tk.LEFT)
+            tk.Label(row, text=value, bg=BG_BLUE, fg=ORANGE, font=FONT_MONO_SM, anchor="w").pack(side=tk.LEFT, fill=tk.X)
+
+        tk.Label(content, text="SYSTEM", bg=BG_BLUE, fg=ORANGE_DIM,
+                 font=("DejaVu Sans Mono", 10, "bold")).pack(anchor="w", pady=(12, 3))
         info_data = [
             ("OS Name", VENV.os_name),
             ("Version", VENV.version),
@@ -1764,6 +4372,7 @@ class YumeGUI(tk.Tk):
             ("Memory", VENV.memory),
             ("Volume", VENV.volume),
             ("FS", VENV.fs_type),
+            ("Disk", f"{VENV.volume} (persistent, blessed)"),
             ("Boot Time", VENV.boot_time.strftime("%Y-%m-%d %H:%M:%S")),
         ]
         for label, value in info_data:
@@ -1771,6 +4380,17 @@ class YumeGUI(tk.Tk):
             row.pack(anchor="w", pady=3, fill=tk.X)
             tk.Label(row, text=f"{label}:", bg=BG_BLUE, fg=ORANGE_DIM, font=FONT_UI_BOLD, width=12, anchor="w").pack(side=tk.LEFT)
             tk.Label(row, text=value, bg=BG_BLUE, fg=ORANGE, font=FONT_MONO_SM, anchor="w").pack(side=tk.LEFT, fill=tk.X)
+
+        st = random.getstate()
+        random.seed(613)
+        load = [random.randint(1, 8) for _ in range(24)]
+        random.setstate(st)
+        tk.Label(content, text="CPU LOAD - 74-MHz, last 24 samples:", bg=BG_BLUE, fg=ORANGE_DIM,
+                 font=("DejaVu Sans Mono", 10, "bold")).pack(anchor="w", pady=(14, 4))
+        for i in range(0, 24, 4):
+            row = "    " + "   ".join("[" + "#" * k + " " * (8 - k) + "]" for k in load[i:i+4])
+            tk.Label(content, text=row, bg=BG_BLUE, fg=ORANGE_BRIGHT,
+                     font=("DejaVu Sans Mono", 9)).pack(anchor="w")
 
         tk.Label(content, text="\nAll values are pretend. The real OS remains untouched.", bg=BG_BLUE,
                  fg=ORANGE_DIM, font=FONT_MONO_SM).pack(anchor="w", pady=(20, 0))
@@ -1782,7 +4402,8 @@ class YumeGUI(tk.Tk):
     def _update_status_bar(self):
         VENV.tick()
         now = datetime.datetime.now().strftime("%H:%M:%S")
-        self.status_left.config(text=f"  {VENV.user}@{VENV.hostname}  |  {self.cwd}       ")
+        persist = "persistent" if DISK_IMAGE.exists() else "fresh"
+        self.status_left.config(text=f"  {VENV.user}@{VENV.hostname}  |  {self.cwd}  |  CholentHD ({persist})       ")
         self.status_right.config(text=now + "   " + VENV.uptime_str() + "   ")
         self.after(1000, self._update_status_bar)
 
